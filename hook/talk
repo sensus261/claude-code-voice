@@ -1,0 +1,76 @@
+#!/bin/bash
+# Stop hook feeding the Claude Voice app (https://github.com/sensus261/claude-code-voice).
+# After every reply in any Claude Code session it saves:
+#   ~/.claude/tts/state/replies/<session>.json  {sid, cwd, project, title, transcript}
+#   ~/.claude/tts/state/replies/<session>.md    last reply, raw markdown
+#   ~/.claude/tts/state/replies/<session>.txt   last reply, cleaned for speech
+# Playback lives in the app. Configured in ~/.claude/settings.json as: talk hook
+
+STATE="$HOME/.claude/tts/state"
+REPLIES="$STATE/replies"
+mkdir -p "$REPLIES" "$STATE/heard"
+
+[ "${1:-}" = hook ] || { echo "Playback moved to the Claude Voice app (~/Applications)."; exit 0; }
+[ -n "${CLAUDE_VOICE_SUMMARY:-}" ] && exit 0   # the app's own summary calls
+
+# Markdown -> speakable text: drop code blocks, URLs, table pipes, symbols.
+clean() {
+  perl -Mutf8 -CSD -0777 -pe '
+    s/```.*?```/\n(code block)\n/gs;
+    s/^\s*\|?[\s:|-]*-{3,}[\s:|-]*$//mg;
+    s/^\s*\|//mg; s/\|\s*$//mg; s/\s*\|\s*/, /g;
+    s/!\[([^\]]*)\]\([^)]*\)/$1/g;
+    s/\[([^\]]+)\]\([^)]*\)/$1/g;
+    s#https?://\S+#link#g;
+    s/`([^`]*)`/$1/g;
+    s/^\s{0,3}#{1,6}\s*//mg;
+    s/^\s*>\s?//mg;
+    s/^\s*(?:[-*+]|\d+[.)])\s+//mg;
+    s/\*\*|__|~~//g;
+    s/(?<!\w)\*(?=\S)|(?<=\S)\*(?!\w)//g;
+    s/→|⇒|->/ to /g; s/←/ from /g; s/≈|~(?=\d)/ about /g;
+    s/≥/ at least /g; s/≤/ at most /g; s/×/ times /g;
+    s/[ \t]+/ /g;
+    s/([^.!?:;,\s])[ \t]*\n/$1.\n/g;
+    s/\n{2,}/\n/g;
+  '
+}
+
+# Text blocks after the last tool call / user message in a transcript.
+JQ_LAST='reduce (split("\n")[] | fromjson?) as $e ([];
+  if $e.type == "user" then []
+  elif $e.type == "assistant" then
+    reduce ($e.message.content[]?) as $c (.;
+      if $c.type == "text" then . + [$c.text]
+      elif $c.type == "tool_use" then []
+      else . end)
+  else . end) | join("\n\n")'
+
+input=$(cat)
+sid=$(jq -r '.session_id // empty' <<<"$input"); [ -n "$sid" ] || exit 0
+cwd=$(jq -r '.cwd // empty' <<<"$input")
+transcript=$(jq -r '.transcript_path // empty' <<<"$input")
+msg=$(jq -r '.last_assistant_message | if type == "string" then . else empty end' <<<"$input" 2>/dev/null)
+if [ -z "$msg" ] && [ -f "$transcript" ]; then
+  msg=$(tail -n 400 "$transcript" | jq -Rrs "$JQ_LAST")
+fi
+[ -n "$msg" ] || exit 0
+
+title=""
+[ -f "$transcript" ] && title=$(grep -E '"type":"(custom-title|ai-title)"' "$transcript" | tail -1 \
+  | jq -r '.customTitle // .title // .aiTitle // empty' 2>/dev/null)
+
+# keep the first project name seen: a session's cwd can drift into subfolders
+old=""
+[ -f "$REPLIES/$sid.json" ] && old=$(jq -r '.project // empty' "$REPLIES/$sid.json" 2>/dev/null)
+
+# metadata first, then the reply; tmp + mv so the app never reads a partial file
+jq -n --arg sid "$sid" --arg cwd "$cwd" --arg title "$title" --arg old "$old" --arg t "$transcript" \
+  '{sid: $sid, cwd: $cwd, title: $title, transcript: $t,
+    project: (if $old != "" then $old elif $cwd == "" then "" else ($cwd | split("/") | last) end)}' \
+  > "$REPLIES/.$sid.json.tmp" && mv "$REPLIES/.$sid.json.tmp" "$REPLIES/$sid.json"
+printf '%s\n' "$msg" > "$REPLIES/.$sid.md.tmp" && mv "$REPLIES/.$sid.md.tmp" "$REPLIES/$sid.md"   # raw, for summaries
+printf '%s\n' "$msg" | clean > "$REPLIES/.$sid.txt.tmp" && mv "$REPLIES/.$sid.txt.tmp" "$REPLIES/$sid.txt"
+
+find "$REPLIES" "$STATE/heard" "$STATE/summaries" -type f -mtime +7 -delete 2>/dev/null
+exit 0
