@@ -1,16 +1,27 @@
 #!/bin/bash
-# Stop hook feeding the Claude Voice app (https://github.com/sensus261/claude-code-voice).
-# After every reply in any Claude Code session it saves:
-#   ~/.claude/tts/state/replies/<session>.json  {sid, cwd, project, title, transcript}
-#   ~/.claude/tts/state/replies/<session>.md    last reply, raw markdown
-#   ~/.claude/tts/state/replies/<session>.txt   last reply, cleaned for speech
-# Playback lives in the app. Configured in ~/.claude/settings.json as: talk hook
+# Hooks feeding the Claude Voice app (https://github.com/sensus261/claude-code-voice).
+#
+#   talk hook      Stop hook. After every reply in any Claude Code session it saves
+#                    ~/.claude/tts/state/replies/<session>.json  {sid, cwd, project, title, transcript}
+#                    ~/.claude/tts/state/replies/<session>.md    last reply, raw markdown
+#                    ~/.claude/tts/state/replies/<session>.txt   last reply, cleaned for speech
+#                  A reply that answers /summarize-for-voice is handed to the app as a summary instead.
+#   talk progress  PostToolUse hook (async). With "Read progress" on in the app, saves the short
+#                  messages Claude writes between tool calls to
+#                    ~/.claude/tts/state/progress/<session>/<time>-<n>.txt
+#   talk prompt    UserPromptSubmit hook. Turns "/voice pause", "/voice back 3" ... into app commands
+#                  without calling the model at all.
+# Playback lives in the app. See README.
 
-STATE="$HOME/.claude/tts/state"
+STATE="${CLAUDE_VOICE_STATE:-$HOME/.claude/tts/state}"
 REPLIES="$STATE/replies"
+PROG="$STATE/progress"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+VOICECTL="$HERE/voicectl"
 mkdir -p "$REPLIES" "$STATE/heard"
 
-[ "${1:-}" = hook ] || { echo "Playback moved to the Claude Voice app (~/Applications)."; exit 0; }
+mode="${1:-}"
+case "$mode" in hook|progress|prompt) ;; *) echo "Playback moved to the Claude Voice app (~/Applications)."; exit 0 ;; esac
 [ -n "${CLAUDE_VOICE_SUMMARY:-}" ] && exit 0   # the app's own summary calls
 
 # Markdown -> speakable text: drop code blocks, URLs, table pipes, symbols.
@@ -36,6 +47,119 @@ clean() {
   '
 }
 
+# Session metadata for the app: cwd, title, project (the first project name seen is kept:
+# a session's cwd can drift into subfolders). tmp + mv so the app never reads a partial file.
+write_meta() {   # write_meta <sid> <cwd> <transcript>
+  local sid="$1" cwd="$2" transcript="$3" title="" old=""
+  [ -f "$transcript" ] && title=$(grep -E '"type":"(custom-title|ai-title)"' "$transcript" | tail -1 \
+    | jq -r '.customTitle // .title // .aiTitle // empty' 2>/dev/null)
+  [ -f "$REPLIES/$sid.json" ] && old=$(jq -r '.project // empty' "$REPLIES/$sid.json" 2>/dev/null)
+  jq -n --arg sid "$sid" --arg cwd "$cwd" --arg title "$title" --arg old "$old" --arg t "$transcript" \
+    '{sid: $sid, cwd: $cwd, title: $title, transcript: $t,
+      project: (if $old != "" then $old elif $cwd == "" then "" else ($cwd | split("/") | last) end)}' \
+    > "$REPLIES/.$sid.json.tmp" && mv "$REPLIES/.$sid.json.tmp" "$REPLIES/$sid.json"
+}
+
+now_ms() { perl -MTime::HiRes=time -e 'printf "%.0f", time*1000' 2>/dev/null || echo "$(date +%s)000"; }
+
+# ───────────────────────────── prompt: /voice … ─────────────────────────────
+if [ "$mode" = prompt ]; then
+  input=$(cat)
+  prompt=$(jq -r '.prompt // empty' <<<"$input" 2>/dev/null)
+  if [[ "$prompt" != *$'\n'* && "$prompt" =~ ^[[:space:]]*(/?)voice([[:space:]]+(.*))?[[:space:]]*$ ]]; then
+    slash="${BASH_REMATCH[1]}"; rest="${BASH_REMATCH[3]}"
+    sid=$(jq -r '.session_id // empty' <<<"$input")
+    out=$("$VOICECTL" "$rest" --sid "$sid"); rc=$?
+    if [ $rc -eq 0 ] || [ -n "$slash" ]; then   # plain "voice …" that is not a command goes to the model
+      jq -n --arg r "$out" '{decision: "block", reason: $r,
+        hookSpecificOutput: {hookEventName: "UserPromptSubmit", suppressOriginalPrompt: true}}'
+      exit 0
+    fi
+  fi
+  # A new turn starts. Forget leftovers of an interrupted one: where its progress stopped, and a
+  # /summarize-for-voice marker that never saw its reply (this prompt is not that command).
+  sid=$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null)
+  if [ -n "$sid" ]; then
+    case "$prompt" in /summarize-for-voice*) ;; *) rm -f "$STATE/pending-summary/$sid" ;; esac
+    [ -f "$STATE/progress-enabled" ] && rm -f "$PROG/$sid.mark"
+  fi
+  exit 0
+fi
+
+# ───────────────────────────── progress: PostToolUse ─────────────────────────────
+# Text blocks of the current turn that come before the newest tool call = progress messages.
+# The transcript has one line per content block; the watermark is a line number, so nothing is
+# read twice. The final reply (after the last tool call) is left to the Stop hook.
+JQ_PROGRESS='[inputs | {n: input_line_number, e: (try fromjson catch null)}]
+  | map(select(.e != null and .e.type == "assistant" and (.e.isSidechain != true)))
+  | ([ .[] | select(any(.e.message.content[]?; .type == "tool_use")) | .n ] | max) as $last
+  | if $last == null then {mark: null, texts: []}
+    else {mark: $last,
+          texts: [ .[] | select(.n <= $last) | .e.message.content[]?
+                   | select(.type == "text") | .text | select(test("\\S")) ]}
+    end'
+
+# first line of the current turn: the last user entry that is not just tool results
+turn_start() {   # turn_start <transcript> -> echoes a line number
+  local t="$1" win=3000 total off n
+  total=$(wc -l < "$t" | tr -d ' ')
+  off=$(( total > win ? total - win : 0 ))
+  n=$(tail -n "$win" "$t" | jq -nR '[inputs | {n: input_line_number, e: (try fromjson catch null)}]
+      | map(select(.e != null and .e.type == "user" and (.e.isSidechain != true)
+            and ((.e.message.content | if type == "string" then true else any(.[]?; .type != "tool_result") end))))
+      | ((last | .n) // empty)' 2>/dev/null)
+  if [ -n "$n" ]; then echo $(( off + n )); else echo "$total"; fi   # none found: start from now
+}
+
+if [ "$mode" = progress ]; then
+  [ -f "$STATE/progress-enabled" ] || exit 0          # off: no work at all
+  input=$(cat)
+  sid=$(jq -r '.session_id // empty' <<<"$input"); [ -n "$sid" ] || exit 0
+  transcript=$(jq -r '.transcript_path // empty' <<<"$input")
+  [ -f "$transcript" ] || exit 0
+  cwd=$(jq -r '.cwd // empty' <<<"$input")
+  mkdir -p "$PROG"
+
+  lock="$PROG/$sid.lock"      # tool calls can finish together: one at a time per session
+  got=""
+  for _ in $(seq 1 40); do
+    if mkdir "$lock" 2>/dev/null; then got=1; break; fi
+    [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rmdir "$lock" 2>/dev/null
+    sleep 0.1
+  done
+  [ -n "$got" ] || exit 0
+  trap 'rmdir "$lock" 2>/dev/null' EXIT
+
+  mark="$PROG/$sid.mark"
+  if [ -f "$mark" ]; then
+    start=$(cat "$mark")
+  else
+    rm -rf "$PROG/$sid"                               # a new turn: forget the last one's notes
+    start=$(turn_start "$transcript")
+  fi
+  [[ "$start" =~ ^[0-9]+$ ]] || start=0
+
+  res=$(tail -n +"$((start + 1))" "$transcript" | jq -nRc "$JQ_PROGRESS" 2>/dev/null)
+  newmark=$(jq -r '.mark // empty' <<<"$res" 2>/dev/null)
+  if [ -z "$newmark" ]; then printf '%s' "$start" > "$mark"; exit 0; fi
+
+  count=$(jq -r '.texts | length' <<<"$res")
+  if [ "$count" -gt 0 ]; then
+    mkdir -p "$PROG/$sid"
+    write_meta "$sid" "$cwd" "$transcript"
+    ms=$(now_ms)
+    for k in $(seq 0 $((count - 1))); do
+      txt=$(jq -r --argjson k "$k" '.texts[$k]' <<<"$res" | clean)
+      [ -n "${txt//[[:space:]]/}" ] || continue
+      f=$(printf '%s/%s-%02d' "$PROG/$sid" "$ms" "$k")
+      printf '%s\n' "$txt" > "$f.tmp" && mv "$f.tmp" "$f.txt"
+    done
+  fi
+  printf '%s' $(( start + newmark )) > "$mark"
+  exit 0
+fi
+
+# ───────────────────────────── hook: Stop ─────────────────────────────
 # Text blocks after the last tool call / user message in a transcript.
 JQ_LAST='reduce (split("\n")[] | fromjson?) as $e ([];
   if $e.type == "user" then []
@@ -54,23 +178,29 @@ msg=$(jq -r '.last_assistant_message | if type == "string" then . else empty end
 if [ -z "$msg" ] && [ -f "$transcript" ]; then
   msg=$(tail -n 400 "$transcript" | jq -Rrs "$JQ_LAST")
 fi
+rm -f "$PROG/$sid.mark"        # the turn is over: the next one starts its progress afresh
 [ -n "$msg" ] || exit 0
 
-title=""
-[ -f "$transcript" ] && title=$(grep -E '"type":"(custom-title|ai-title)"' "$transcript" | tail -1 \
-  | jq -r '.customTitle // .title // .aiTitle // empty' 2>/dev/null)
+# This reply answers /summarize-for-voice (its command marked the session): hand it to the app as
+# the summary of the previous reply, and leave the saved reply alone.
+pending="$STATE/pending-summary/$sid"
+if [ -f "$pending" ]; then
+  age=$(( $(date +%s) - $(stat -f %m "$pending" 2>/dev/null || echo 0) ))
+  rm -f "$pending"
+  if [ "$age" -lt 180 ] && [ -f "$REPLIES/$sid.txt" ]; then
+    mkdir -p "$STATE/inbox"
+    printf '%s\n' "$msg" | clean > "$STATE/inbox/.summary-$sid.tmp" \
+      && mv "$STATE/inbox/.summary-$sid.tmp" "$STATE/inbox/summary-$sid.txt"
+    "$VOICECTL" emit summary "$sid" >/dev/null
+    exit 0
+  fi
+fi
 
-# keep the first project name seen: a session's cwd can drift into subfolders
-old=""
-[ -f "$REPLIES/$sid.json" ] && old=$(jq -r '.project // empty' "$REPLIES/$sid.json" 2>/dev/null)
-
-# metadata first, then the reply; tmp + mv so the app never reads a partial file
-jq -n --arg sid "$sid" --arg cwd "$cwd" --arg title "$title" --arg old "$old" --arg t "$transcript" \
-  '{sid: $sid, cwd: $cwd, title: $title, transcript: $t,
-    project: (if $old != "" then $old elif $cwd == "" then "" else ($cwd | split("/") | last) end)}' \
-  > "$REPLIES/.$sid.json.tmp" && mv "$REPLIES/.$sid.json.tmp" "$REPLIES/$sid.json"
+# metadata first, then the reply
+write_meta "$sid" "$cwd" "$transcript"
 printf '%s\n' "$msg" > "$REPLIES/.$sid.md.tmp" && mv "$REPLIES/.$sid.md.tmp" "$REPLIES/$sid.md"   # raw, for summaries
 printf '%s\n' "$msg" | clean > "$REPLIES/.$sid.txt.tmp" && mv "$REPLIES/.$sid.txt.tmp" "$REPLIES/$sid.txt"
 
-find "$REPLIES" "$STATE/heard" "$STATE/summaries" -type f -mtime +7 -delete 2>/dev/null
+find "$REPLIES" "$STATE/heard" "$STATE/summaries" "$STATE/progress" "$STATE/inbox" "$STATE/commands" \
+  -type f -mtime +7 -delete 2>/dev/null
 exit 0

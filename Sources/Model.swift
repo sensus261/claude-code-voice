@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 /// A summary waiting for the user's OK (shown as an alert).
@@ -12,8 +13,12 @@ struct SummaryAsk: Identifiable {
     let onDone: (Bool) -> Void
 }
 
-/// Wires the reply store, summarizer and speaker: heard markers, auto-read, headers,
-/// and the confirmation before any Claude call. Claude is only called on explicit request.
+/// Wires the reply store, summarizer and speaker: heard markers, auto-read, headers, commands from
+/// Claude Code, and the confirmation before any Claude call.
+///
+/// No LLM call is ever made automatically. The automatic paths (`autoRead`, `autoReadProgress`)
+/// only queue text the hooks already saved. The one Claude call this app can start is the Haiku
+/// summary (`Summarizer.summary(.quick)`), and only behind the confirmation alert.
 @MainActor
 final class AppModel: ObservableObject {
     static let shared = AppModel()
@@ -29,6 +34,8 @@ final class AppModel: ObservableObject {
 
     private var lastSid: String?
     private var request = 0   // the newest explicit play request wins
+    private var inbox: CommandInbox?
+    private var lastStatus = Data()
 
     private init() {
         Voices.migrate()
@@ -38,6 +45,17 @@ final class AppModel: ObservableObject {
             self?.lastSid = sid
         }
         store.onNewReply = { [weak self] s in self?.autoRead(s) }
+        store.onNewProgress = { [weak self] n in self?.autoReadProgress(n) }
+        inbox = CommandInbox { [weak self] c in self?.run(c) }
+        syncProgressFlag()
+        writeStatus()
+        // Keeps `voicectl status`, the summary language and the progress flag current.
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.syncProgressFlag()
+                self?.writeStatus()
+            }
+        }
     }
 
     // MARK: playing
@@ -68,11 +86,38 @@ final class AppModel: ObservableObject {
 
     /// Auto-read always uses the full reply: no Claude calls without a click.
     private func autoRead(_ s: Session) {
-        let d = UserDefaults.standard
-        guard !s.hidden, d.bool(forKey: "autoAll") || AutoRead.contains(d.string(forKey: "autoSids") ?? "", s.id) else { return }
+        guard shouldAutoRead(s.id) else { return }
+        speaker.dropQueuedProgress(sid: s.id)    // the final reply supersedes progress not yet spoken
         var it = fullItem(s)
-        if speaker.state != .idle || lastSid != s.id { it = withHeader(it, s) }
+        if needsHeader(s.id) { it = withHeader(it, project: s.displayProject, title: s.title) }
         speaker.enqueue(it)
+    }
+
+    /// With "Read progress" on, the short messages between tool calls are read as they appear.
+    /// Same gate as `autoRead`; text only, no Claude calls.
+    private func autoReadProgress(_ n: ProgressNote) {
+        guard UserDefaults.standard.bool(forKey: "readProgress"), shouldAutoRead(n.sid) else { return }
+        let lines = Sentences.split(n.text)
+        guard !lines.isEmpty else { return }
+        var it = PlayItem(sid: n.sid, lines: lines, voiceID: Voices.replyVoiceID(for: n.text), isProgress: true)
+        if needsHeader(n.sid) {
+            let meta = store.readMeta(n.sid)
+            it = withHeader(it, project: meta["project"] ?? "", title: meta["title"] ?? "")
+        }
+        speaker.enqueue(it)
+    }
+
+    /// Auto-read is on for every session, or for this one, and the session is not hidden.
+    private func shouldAutoRead(_ sid: String) -> Bool {
+        let d = UserDefaults.standard
+        return !store.isHidden(sid)
+            && (d.bool(forKey: "autoAll") || AutoRead.contains(d.string(forKey: "autoSids") ?? "", sid))
+    }
+
+    /// Say "From <project>." when the listener may not know whose text comes next.
+    private func needsHeader(_ sid: String) -> Bool {
+        if speaker.state != .idle { return speaker.items.last?.sid != sid }
+        return lastSid != sid
     }
 
     // MARK: summaries (always confirmed first)
@@ -92,30 +137,14 @@ final class AppModel: ObservableObject {
                     + "It sees only this reply, not the rest of the conversation.",
                 canRun: true, onConfirm: onConfirm, onDone: then)
         case .session:
-            guard let info = SessionInfo.of(s) else {
-                ask = SummaryAsk(session: s, mode: mode, title: "Session summary unavailable",
-                                 message: "This session's log could not be found.", canRun: false,
-                                 onConfirm: {}, onDone: then)
-                return
-            }
-            let k = max(1, info.contextTokens / 1000)
-            let model = info.model.map(Self.modelName) ?? "its model"
-            let idle = ago(info.lastActivity, Date())
-            var msg = "The \(s.displayProject) session itself (\(model)) writes the summary in \(lang.name), "
-                + "with the whole conversation as context. It uses your Claude subscription and takes "
-                + "about 20 seconds. "
-            if info.cacheLikelyWarm {
-                msg += "It re-reads about \(k)k tokens of conversation from cache, roughly like sending "
-                    + "one short message in that session (last activity: \(idle == "now" ? "just now" : idle + " ago"))."
-            } else {
-                msg += "Its cache has probably expired (last activity \(idle) ago), so all \(k)k tokens are "
-                    + "processed again: several times the usage of a normal message."
-            }
-            if info.lastActivity.timeIntervalSince(s.modified) > 10 {
-                msg += "\n\nThe session seems to be working right now; the summary may describe its newest progress."
-            }
-            ask = SummaryAsk(session: s, mode: mode, title: "Create a session summary?", message: msg,
-                             canRun: true, onConfirm: onConfirm, onDone: then)
+            // Never run from here: the session writes it itself (see hook/commands/summarize-for-voice.md).
+            ask = SummaryAsk(
+                session: s, mode: mode, title: "No session summary yet",
+                message: "In the Claude Code session \(s.displayProject), run /summarize-for-voice. The session "
+                    + "writes the summary itself from its own memory, which costs about one short message "
+                    + "there while its cache is warm. It appears here and plays on its own. "
+                    + "Nothing is sent from this app.",
+                canRun: false, onConfirm: {}, onDone: then)
         case .full:
             break
         }
@@ -144,23 +173,118 @@ final class AppModel: ObservableObject {
     }
 
     private func summaryItem(_ s: Session, _ text: String, _ mode: ReadMode) -> PlayItem {
-        PlayItem(sid: s.id, lines: Sentences.split(text), mode: mode, voiceID: Voices.summaryVoiceID())
+        // A Haiku summary is in the chosen summary language; a session's own is in whatever it wrote.
+        let voice = mode == .quick ? Voices.summaryVoiceID() : Voices.replyVoiceID(for: text)
+        return PlayItem(sid: s.id, lines: Sentences.split(text), mode: mode, voiceID: voice)
     }
 
     private func withHeader(_ it: PlayItem, _ s: Session) -> PlayItem {
-        let project = s.displayProject.replacingOccurrences(of: "-", with: " ")
-            .replacingOccurrences(of: "_", with: " ")
-        let line = "From \(project)." + (s.title.isEmpty ? "" : " \(s.title).")
-        return PlayItem(sid: it.sid, lines: [line] + it.lines, mode: it.mode, voiceID: it.voiceID,
-                        headerLines: it.headerLines + 1)
+        withHeader(it, project: s.displayProject, title: s.title)
     }
 
-    static func modelName(_ id: String) -> String {
-        // "claude-opus-5-5" -> "Opus 5.5"
-        let parts = id.replacingOccurrences(of: "claude-", with: "").split(separator: "-")
-        guard let family = parts.first else { return id }
-        let version = parts.dropFirst().prefix { $0.allSatisfy(\.isNumber) && $0.count <= 2 }.joined(separator: ".")
-        return family.capitalized + (version.isEmpty ? "" : " \(version)")
+    private func withHeader(_ it: PlayItem, project: String, title: String) -> PlayItem {
+        let name = (project.isEmpty ? "session" : project).replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+        let line = "From \(name)." + (title.isEmpty ? "" : " \(title).")
+        var out = it
+        out = PlayItem(sid: it.sid, lines: [line] + it.lines, mode: it.mode, voiceID: it.voiceID,
+                       headerLines: it.headerLines + 1, isProgress: it.isProgress)
+        return out
+    }
+
+    // MARK: commands from Claude Code (hook/voicectl)
+
+    func run(_ c: VoiceCommand) {
+        let d = UserDefaults.standard
+        switch c.action {
+        case "pause": speaker.pause()
+        case "resume": speaker.resume()
+        case "stop": speaker.stop()
+        case "restart": speaker.restart()
+        case "next": speaker.skip()
+        case "prev": speaker.prev()
+        case "back": speaker.back(c.count)
+        case "fwd": speaker.next(c.count)
+        case "play": playCommand(sid: c.sid, summary: c.arg == "summary")
+        case "auto": d.set(c.arg == "on", forKey: "autoAll")
+        case "progress": d.set(c.arg == "on", forKey: "readProgress"); syncProgressFlag()
+        case "speed":
+            let x = Double(c.arg ?? "") ?? 1
+            d.set(min(0.7, max(0.3, x * Double(AVSpeechUtteranceDefaultSpeechRate))), forKey: "rate")
+        case "summary": if let sid = c.arg { importSummary(sid) }
+        default: break
+        }
+        writeStatus()
+    }
+
+    /// "/voice play": the session's latest reply (or the newest unheard one), or its summary.
+    private func playCommand(sid: String?, summary: Bool) {
+        let target = store.sessions.first { $0.id == sid && !$0.hidden }
+            ?? store.visible.first(where: \.isNew) ?? store.visible.first
+        guard let s = target else { return }
+        guard summary else { play(s); return }
+        let mode: ReadMode? = summarizer.cached(s, .session) != nil ? .session
+            : summarizer.cached(s, .quick) != nil ? .quick : nil
+        if let mode {
+            play(s, mode: mode)
+        } else {
+            request += 1
+            speaker.play([PlayItem(sid: "_note", lines: ["There is no summary for this reply yet."])])
+        }
+    }
+
+    /// The session wrote its own summary (/summarize-for-voice): keep it, and read it now. The user
+    /// asked for it, so it plays even when auto-read is off.
+    private func importSummary(_ sid: String) {
+        let file = Paths.inbox.appendingPathComponent("summary-\(sid).txt")
+        let text = ((try? String(contentsOf: file, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        try? FileManager.default.removeItem(at: file)
+        guard !text.isEmpty, let s = store.sessions.first(where: { $0.id == sid }) else { return }
+        summarizer.storeImported(text, for: s)
+        request += 1
+        var it = summaryItem(s, text, .session)
+        if lastSid != s.id { it = withHeader(it, s) }
+        speaker.play([it])
+    }
+
+    // MARK: progress flag + status
+
+    /// The PostToolUse hook does nothing unless this file exists (zero cost while the mode is off).
+    func syncProgressFlag() {
+        let fm = FileManager.default
+        let on = UserDefaults.standard.bool(forKey: "readProgress")
+        let exists = fm.fileExists(atPath: Paths.progressFlag.path)
+        if on && !exists {
+            try? fm.createDirectory(at: Paths.base, withIntermediateDirectories: true)
+            fm.createFile(atPath: Paths.progressFlag.path, contents: Data())
+        } else if !on && exists {
+            try? fm.removeItem(at: Paths.progressFlag)
+        }
+    }
+
+    /// What `voicectl status` prints, and the language /summarize-for-voice should write in.
+    func writeStatus() {
+        let d = UserDefaults.standard
+        let state = speaker.state == .playing ? "playing" : speaker.state == .paused ? "paused" : "idle"
+        var line = 0, total = 0
+        if speaker.lines.indices.contains(speaker.index) {
+            let l = speaker.lines[speaker.index]
+            line = l.local + 1
+            total = speaker.lines(ofItem: l.item).count
+        }
+        let sid = speaker.displayItem.map { speaker.items[$0].sid }
+        let obj: [String: Any] = [
+            "state": state,
+            "reply": store.sessions.first { $0.id == sid }?.displayProject ?? "",
+            "line": line, "lines": total,
+            "autoAll": d.bool(forKey: "autoAll"), "readProgress": d.bool(forKey: "readProgress"),
+            "rate": (Settings.speed * 100).rounded() / 100,
+            "summaryLanguage": Languages.selected.name,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
+              data != lastStatus else { return }
+        lastStatus = data
+        try? data.write(to: Paths.status, options: .atomic)
     }
 }
 

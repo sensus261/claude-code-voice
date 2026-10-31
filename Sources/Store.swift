@@ -21,10 +21,30 @@ struct Session: Identifiable, Equatable {
 }
 
 enum Paths {
-    static let base = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude/tts/state")
+    /// CLAUDE_VOICE_STATE moves the whole state folder (the hooks honor it too); used by tests.
+    static let base: URL = ProcessInfo.processInfo.environment["CLAUDE_VOICE_STATE"]
+        .map { URL(fileURLWithPath: $0) }
+        ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/tts/state")
     static let replies = base.appendingPathComponent("replies")
     static let heard = base.appendingPathComponent("heard")
+    /// Short messages Claude writes between tool calls: progress/<sid>/<time>-<n>.txt (see hook/talk).
+    static let progress = base.appendingPathComponent("progress")
+    /// Commands from Claude Code (hook/voicectl): commands/<time>.cmd.
+    static let commands = base.appendingPathComponent("commands")
+    /// Summaries written by the sessions themselves (/summarize-for-voice): inbox/summary-<sid>.txt.
+    static let inbox = base.appendingPathComponent("inbox")
+    /// Exists while "Read progress" is on; the PostToolUse hook does nothing without it.
+    static let progressFlag = base.appendingPathComponent("progress-enabled")
+    /// What the app is doing, for `voicectl status`.
+    static let status = base.appendingPathComponent("status.json")
+}
+
+/// One of Claude's between-tool messages ("Now checking the parser."), saved by the hook.
+struct ProgressNote: Identifiable, Equatable {
+    let id: String          // "<sid>/<file>"
+    let sid: String
+    let text: String
+    let time: Date
 }
 
 /// Watches the replies folder (polling; it holds a few dozen tiny files).
@@ -39,6 +59,12 @@ final class Store: ObservableObject {
     /// A session finished a new reply since the app started.
     var onNewReply: ((Session) -> Void)?
 
+    /// Progress messages of each session's current (or last) turn, oldest first.
+    @Published private(set) var progress: [String: [ProgressNote]] = [:]
+
+    /// A session wrote a new progress message since the app started.
+    var onNewProgress: ((ProgressNote) -> Void)?
+
     var visible: [Session] { sessions.filter { !$0.hidden } }
     var hiddenCount: Int { sessions.lazy.filter(\.hidden).count }
 
@@ -48,11 +74,15 @@ final class Store: ObservableObject {
     private var contextPending: Set<String> = []
     private var timer: Timer?
     private var firstScan = true
+    private var seenProgress: Set<String> = []
+    private var progressCache: [String: ProgressNote] = [:]
+    private var firstProgressScan = true
 
     init() {
         let fm = FileManager.default
         try? fm.createDirectory(at: Paths.replies, withIntermediateDirectories: true)
         try? fm.createDirectory(at: Paths.heard, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: Paths.progress, withIntermediateDirectories: true)
         scan()
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             self?.scan()
@@ -93,7 +123,49 @@ final class Store: ObservableObject {
         let ended = hiddenAt.filter { sid, at in at >= 0 && !out.contains { $0.id == sid && $0.hidden } }
         if !ended.isEmpty { save(hiddenAt.filter { ended[$0.key] == nil }) }
         firstScan = false
+        scanProgress()    // before the replies: a turn's progress notes come before its final reply
         fresh.sorted { $0.modified < $1.modified }.forEach { onNewReply?($0) }
+    }
+
+    /// Reads progress/<sid>/*.txt. Notes that exist at launch are not "new".
+    private func scanProgress() {
+        let fm = FileManager.default
+        let dirs = (try? fm.contentsOfDirectory(at: Paths.progress, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        var out: [String: [ProgressNote]] = [:]
+        var cache: [String: ProgressNote] = [:]
+        var fresh: [ProgressNote] = []
+        for d in dirs where (try? d.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+            let sid = d.lastPathComponent
+            let files = ((try? fm.contentsOfDirectory(at: d, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+                .filter { $0.pathExtension == "txt" && !$0.lastPathComponent.hasPrefix(".") }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            var notes: [ProgressNote] = []
+            for f in files {
+                let id = "\(sid)/\(f.lastPathComponent)"
+                var note = progressCache[id]
+                if note == nil {
+                    let text = ((try? String(contentsOf: f, encoding: .utf8)) ?? "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !text.isEmpty else { continue }
+                    note = ProgressNote(id: id, sid: sid, text: text, time: modDate(f) ?? Date())
+                }
+                cache[id] = note!
+                notes.append(note!)
+                if seenProgress.insert(id).inserted, !firstProgressScan { fresh.append(note!) }
+            }
+            if !notes.isEmpty { out[sid] = notes }
+        }
+        progressCache = cache
+        seenProgress.formIntersection(cache.keys)
+        if out != progress { progress = out }
+        firstProgressScan = false
+        fresh.sorted { $0.time < $1.time }.forEach { onNewProgress?($0) }
+    }
+
+    /// Hidden for good, or hidden until its next reply.
+    func isHidden(_ sid: String) -> Bool {
+        if let s = sessions.first(where: { $0.id == sid }) { return s.hidden }
+        return (hiddenAt[sid] ?? 0) < 0
     }
 
     /// Reads the context size from the session's transcript once per reply, off the main thread.
@@ -147,7 +219,7 @@ final class Store: ObservableObject {
         (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
     }
 
-    private func readMeta(_ sid: String) -> [String: String] {
+    func readMeta(_ sid: String) -> [String: String] {
         let url = Paths.replies.appendingPathComponent("\(sid).json")
         guard let data = try? Data(contentsOf: url),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }

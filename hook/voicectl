@@ -1,0 +1,109 @@
+#!/bin/bash
+# Remote control for the Claude Voice app. Drops a command file the app picks up:
+#   ~/.claude/tts/state/commands/<time>.cmd
+#
+#   voicectl pause | resume | stop | restart | next | prev
+#   voicectl play [full|summary]      read this session's latest reply (or its summary)
+#   voicectl back [N] | fwd [N]       N sentences (default 1)
+#   voicectl auto on|off              auto-read new replies from every session
+#   voicectl progress on|off          also read the short progress messages
+#   voicectl speed 1.2                speaking rate multiplier
+#   voicectl status                   what the app is doing now
+#   add  --sid <session id>  to target a session (the hook and /voice do this for you)
+#
+# Exit codes: 0 ok (message on stdout), 3 not a voice command (nothing sent).
+
+set -f   # no globbing of "*" typed as an argument
+STATE="${CLAUDE_VOICE_STATE:-$HOME/.claude/tts/state}"
+CMDS="$STATE/commands"
+
+usage() {
+  echo "voice: pause | resume | stop | play [summary] | back N | fwd N | next | prev | restart | auto on/off | progress on/off | speed X | status"
+}
+
+now_us() {
+  perl -MTime::HiRes=time -e 'printf "%.0f", time*1000000' 2>/dev/null || echo "$(date +%s)000000"
+}
+
+# command line -> words, with --sid pulled out
+sid=""; words=()
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+  for w in ${args[$i]}; do          # one quoted argument may hold several words ("back 3")
+    if [ "$w" = "--sid" ]; then
+      i=$((i + 1)); sid="${args[$i]:-}"
+      break
+    fi
+    words+=("$w")
+  done
+  i=$((i + 1))
+done
+
+action="${words[0]:-}"
+arg="${words[1]:-}"
+
+# a sentence that merely starts with "voice pause ..." is not a command
+case "$action" in
+  pause|resume|stop|restart|next|prev|previous|status|continue) max=1 ;;
+  summary-prep|emit) max=99 ;;
+  *) max=2 ;;
+esac
+[ ${#words[@]} -le $max ] || { usage; exit 3; }
+
+send() {   # send "<line>"
+  mkdir -p "$CMDS"
+  local f="$CMDS/$(now_us).cmd"
+  printf '%s\n' "$1" > "$CMDS/.tmp.$$" && mv "$CMDS/.tmp.$$" "$f"
+}
+
+case "$action" in
+  start) action=play ;;
+  continue) action=resume ;;
+  forward|forth|ahead) action=fwd ;;
+  previous) action=prev ;;
+esac
+
+line=""
+case "$action" in
+  pause|resume|stop|restart|next|prev) line="$action" ;;
+  play)
+    case "$arg" in ""|full) line="play full" ;; summary|sum) line="play summary" ;; *) usage; exit 3 ;; esac ;;
+  back|fwd)
+    [ -z "$arg" ] && arg=1
+    [[ "$arg" =~ ^[0-9]{1,3}$ ]] || { usage; exit 3; }
+    line="$action $arg" ;;
+  auto|progress)
+    case "$arg" in on|off) line="$action $arg" ;; *) usage; exit 3 ;; esac ;;
+  speed)
+    [[ "$arg" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { usage; exit 3; }
+    line="speed $arg" ;;
+  status)
+    if [ -f "$STATE/status.json" ]; then
+      jq -r '"voice: \(.state)" + (if .reply != "" and .reply != null then " · \(.reply)" else "" end)
+        + " · line \(.line)/\(.lines) · auto " + (if .autoAll then "on" else "off" end)
+        + " · progress " + (if .readProgress then "on" else "off" end) + " · speed \(.rate)"' \
+        "$STATE/status.json" 2>/dev/null || echo "voice: status unreadable"
+    else
+      echo "voice: app has not reported yet (is Claude Voice running?)"
+    fi
+    exit 0 ;;
+  # internal: used by the /summarize-for-voice command and the Stop hook
+  summary-prep)
+    # mark that the next reply of this session is a voice summary; print the language to use
+    [ -n "$sid" ] || sid="$arg"
+    [ -n "$sid" ] || exit 0
+    mkdir -p "$STATE/pending-summary" && touch "$STATE/pending-summary/$sid"
+    lang=""
+    [ -f "$STATE/status.json" ] && lang=$(jq -r '.summaryLanguage // empty' "$STATE/status.json" 2>/dev/null)
+    [ -n "$lang" ] && echo "Language to write in: $lang."
+    exit 0 ;;
+  emit)   # emit <raw command line words…>
+    send "${words[*]:1}"; exit 0 ;;
+  *) usage; exit 3 ;;
+esac
+
+[ -n "$sid" ] && line="$line --sid $sid"
+send "$line"
+echo "🔊 ${line%% --sid*}"
+exit 0

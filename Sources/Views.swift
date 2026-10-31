@@ -53,6 +53,7 @@ struct Reader: View {
     @EnvironmentObject private var store: Store
     @EnvironmentObject private var summarizer: Summarizer
     @State private var mode: ReadMode = .full
+    @State private var showProgress = false
 
     private var session: Session? { store.sessions.first { $0.id == selected } }
 
@@ -82,6 +83,7 @@ struct Reader: View {
             if let s = session {
                 header(s)
                 content(s)
+                progressSection(s)
             } else {
                 VStack(spacing: 6) {
                     Image(systemName: "waveform").font(.largeTitle).foregroundStyle(.tertiary)
@@ -115,12 +117,12 @@ struct Reader: View {
                 Picker("", selection: Binding(get: { mode }, set: { setMode($0, s) })) {
                     Text("Full · \(s.words)w").tag(ReadMode.full)
                     Text("Summary (low cost)").tag(ReadMode.quick)
-                    Text("Summary (session cost)").tag(ReadMode.session)
+                    Text("Summary (from Claude Code)").tag(ReadMode.session)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .controlSize(.small)
-                .help("Summaries call Claude once, after you confirm, then they are cached")
+                .help("Low cost: Haiku summarizes after you confirm. From Claude Code: run /summarize-for-voice in that session")
             }
         }
     }
@@ -155,10 +157,12 @@ struct Reader: View {
                     } else if summarizer.isWorking(s.id, mode) {
                         HStack(spacing: 6) {
                             ProgressView().controlSize(.small)
-                            Text(mode == .session ? "The session is writing its summary…" : "Summarizing…")
-                                .foregroundStyle(.secondary)
+                            Text("Summarizing…").foregroundStyle(.secondary)
                         }
                         .padding(8)
+                    } else if mode == .session {
+                        Text("Run /summarize-for-voice in this Claude Code session. The summary shows up here and plays on its own.")
+                            .foregroundStyle(.secondary).padding(8)
                     } else {
                         Button("Create summary…") { setMode(mode, s) }.padding(8)
                     }
@@ -221,13 +225,30 @@ struct Reader: View {
     }
 
     private func summaryCaption(_ s: Session) -> String {
-        let lang = Languages.selected.name
-        if mode == .quick { return "Summary by Claude Haiku 5.5 · \(lang) · cached" }
-        var c = "Summary by the session itself · \(lang) · cached"
-        if let r = summarizer.cachedInfo(s, mode)?["cacheRead"] as? Int, r > 0 {
-            c += " · re-read \(r / 1000)k tokens from cache"
+        if mode == .quick { return "Summary by Claude Haiku 5.5 · \(Languages.selected.name) · cached" }
+        return "Summary written by the Claude Code session itself · cached"
+    }
+
+    /// Claude's short messages between tool calls (recorded while "Read progress" is on).
+    @ViewBuilder private func progressSection(_ s: Session) -> some View {
+        let notes = store.progress[s.id] ?? []
+        if !notes.isEmpty {
+            DisclosureGroup(isExpanded: $showProgress) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(notes) { n in
+                            Text(n.text)
+                                .font(.caption).foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .frame(maxHeight: 90)
+            } label: {
+                Label("Progress · \(notes.count)", systemImage: "list.bullet")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
-        return c
     }
 
     private func highlighted(_ s: String, _ r: NSRange?) -> AttributedString {
@@ -503,7 +524,7 @@ struct SessionList: View {
         Button("Play") { selected = s.id; AppModel.shared.play(s) }
         if s.words >= AppModel.summaryMinWords {
             Button("Play Summary (low cost)…") { playSummary(s, .quick) }
-            Button("Play Summary (session cost)…") { playSummary(s, .session) }
+            Button("Play Summary from Claude Code") { playSummary(s, .session) }
         }
         Button("Add to Queue") { AppModel.shared.queue(s) }
         Divider()
@@ -614,6 +635,7 @@ struct SettingsView: View {
     @AppStorage("voiceID") private var voiceID = ""
     @AppStorage("rate") private var rate = Double(AVSpeechUtteranceDefaultSpeechRate)
     @AppStorage("autoAll") private var autoAll = false
+    @AppStorage("readProgress") private var readProgress = false
     @AppStorage("allLanguages") private var allLanguages = false
     @AppStorage("matchLanguage") private var matchLanguage = true
     @AppStorage("summaryLang") private var summaryLang = "ro-RO"
@@ -629,6 +651,22 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section("Playback") {
+                LabeledContent("Speed") {
+                    HStack {
+                        Slider(value: $rate, in: 0.3...0.7)
+                        Text(String(format: "%.1f×", rate / Double(AVSpeechUtteranceDefaultSpeechRate)))
+                            .monospacedDigit().frame(width: 34, alignment: .trailing)
+                    }
+                }
+                Toggle("Auto-read new replies from every session (full text)", isOn: $autoAll)
+                Toggle("Also read progress updates", isOn: $readProgress)
+                    .onChange(of: readProgress) { _, _ in AppModel.shared.syncProgressFlag() }
+                Text("The short messages Claude writes between tasks are read as they appear, for the sessions that are auto-read, and recorded under each reply. Needs the PostToolUse hook (scripts/install-integration.sh). Updates not yet spoken when the final reply arrives are skipped.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Test Voice") { AppModel.shared.speaker.test() }
+            }
             Section("Full text") {
                 Picker("Voice", selection: $voiceID) {
                     ForEach(voices) { v in Text("\(v.label)  \(v.language)").tag(v.id) }
@@ -642,7 +680,7 @@ struct SettingsView: View {
                     ForEach(Languages.all, id: \.code) { l in Text(l.native).tag(l.code) }
                 }
                 LanguageVoicePicker(lang: summaryLang).id(summaryLang)
-                Text("Summaries are made only when you ask and confirm, through your Claude subscription. Low cost: Claude Haiku 5.5 reads only the reply. Session cost: the session itself summarizes with full context (about one short message there while its cache is warm).")
+                Text("Low cost: Claude Haiku 5.5 reads only the reply, made only when you ask and confirm. From Claude Code: run /summarize-for-voice in the session; it writes the summary itself (about one short message of usage) and this app reads it. Auto-read never calls Claude.")
                     .font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -673,20 +711,9 @@ struct SettingsView: View {
                     .disabled(catalog.scanning)
                 }
             }
-            Section("Playback") {
-                LabeledContent("Speed") {
-                    HStack {
-                        Slider(value: $rate, in: 0.3...0.7)
-                        Text(String(format: "%.1f×", rate / Double(AVSpeechUtteranceDefaultSpeechRate)))
-                            .monospacedDigit().frame(width: 34, alignment: .trailing)
-                    }
-                }
-                Toggle("Auto-read new replies from every session (full text)", isOn: $autoAll)
-                Button("Test Voice") { AppModel.shared.speaker.test() }
-            }
         }
         .formStyle(.grouped)
-        .frame(width: 420, height: 600)
+        .frame(width: 420, height: 680)
         .onAppear {
             if voiceID.isEmpty { voiceID = Voices.mainID }
         }

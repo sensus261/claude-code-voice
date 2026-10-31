@@ -1,7 +1,8 @@
 import AVFoundation
 import Foundation
 
-/// How a reply is read: the real text, Haiku's summary, or the session's own summary.
+/// How a reply is read: the real text, Haiku's summary, or the summary the session wrote itself
+/// (/summarize-for-voice in Claude Code).
 enum ReadMode: String, CaseIterable {
     case full, quick, session
 }
@@ -13,6 +14,7 @@ struct PlayItem {
     var mode: ReadMode = .full
     var voiceID: String?        // nil = main voice
     var headerLines = 0         // spoken "From <project>." lines before the reply (main voice)
+    var isProgress = false      // a short between-tool-calls message, not the reply (see dropQueuedProgress)
 }
 
 /// A sentence in the playlist. `id` is its position in the whole playlist, `local` in its reply.
@@ -132,6 +134,11 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, AV
         if startsItem { onItemStart?(items[lines[i].item].sid) }
     }
 
+    /// Explicit versions of togglePause, for commands from Claude Code (idempotent).
+    func pause() { if state == .playing { togglePause() } }
+
+    func resume() { if state != .playing { togglePause() } }
+
     func togglePause() {
         switch state {
         case .playing:
@@ -171,6 +178,31 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, AV
     func restart() {
         guard let it = displayItem else { return }
         speak(at: lines.firstIndex { $0.item == it } ?? 0)
+    }
+
+    /// Jump to the first sentence of the previous reply.
+    func prev() {
+        guard let it = displayItem, it > 0 else { return restart() }
+        speak(at: lines.firstIndex { $0.item == it - 1 } ?? 0)
+    }
+
+    /// A reply is final: progress messages of that session that have not started playing are stale.
+    /// They are removed from the playlist (the app still has them recorded).
+    func dropQueuedProgress(sid: String) {
+        guard lines.indices.contains(index) else { return }
+        let cur = lines[index].item
+        let doomed = items.indices.filter { $0 > cur && items[$0].isProgress && items[$0].sid == sid }
+        guard !doomed.isEmpty else { return }
+        let kept = items.enumerated().filter { !doomed.contains($0.offset) }.map(\.element)
+        var rebuilt: [Line] = []
+        for (n, item) in kept.enumerated() {
+            for (i, text) in item.lines.enumerated() {
+                rebuilt.append(Line(id: rebuilt.count, item: n, local: i, text: text))
+            }
+        }
+        items = kept
+        lines = rebuilt              // everything up to the current item is unchanged: index stays valid
+        if let s = startedItem, s > cur { startedItem = cur }
     }
 
     /// Jump to the first sentence of the next reply.

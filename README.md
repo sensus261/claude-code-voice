@@ -13,36 +13,41 @@ It lists every Claude Code session that has replied recently, shows each reply f
 - **Reader that looks like Claude Code.** Click a session to see its reply rendered from markdown: headings, bold, inline code, links, lists, tables, quotes and code blocks. The sentence being read is highlighted. Click any block to start reading from there.
 - **Proper playback.** Play and pause, previous and next sentence, restart the reply, skip to the next reply, stop. One continuous voice, no gaps, exact sentence positions.
 - **Auto-read per session.** Turn it on for the sessions you want to hear as soon as they reply. Replies from several sessions queue up and never talk over each other.
+- **Progress updates.** Optionally, the short messages Claude writes between tasks ("Now checking the parser.") are read as they appear, not only the final reply, and recorded under the reply. If one has not been spoken yet when the final reply arrives, it is skipped so the reply starts right away.
+- **Control it from Claude Code.** `/voice pause`, `/voice back 3`, `/voice play` and more, typed in any session, also from your phone through Remote Control. Hook-handled commands use no model tokens. See [Control it from Claude Code](#control-it-from-claude-code).
 - **Spoken summaries, only on request.** Three tabs per reply:
   - **Full**: the real reply, read in full.
-  - **Summary (low cost)**: Claude Haiku 5.5 condenses the reply text.
-  - **Summary (session cost)**: the session itself summarizes, with the whole conversation as context.
+  - **Summary (low cost)**: Claude Haiku 5.5 condenses the reply text (you confirm first).
+  - **Summary (from Claude Code)**: you run `/summarize-for-voice` in the session; the session writes the summary itself from its own memory and the app reads it.
 
-  Summaries are written entirely in the language you choose (Romanian by default) and read by a voice for that language. The app asks for confirmation before every summary it has not made yet, and caches the result.
+  Summaries are written entirely in the language you choose (Romanian by default) and read by a voice for that language.
+- **Auto-read never calls Claude.** It only plays text the hooks already saved. Every Claude call is explicit.
 - **Each reply in its own language.** A reply written in another language than the main voice (for example Romanian) is read by that language's voice.
 - **Better voices than macOS has for some languages.** Besides the macOS voices, the app can use [Piper](https://github.com/OHF-Voice/piper1-gpl) neural voices, which run offline on your Mac, and Microsoft's neural voices through [edge-tts](https://github.com/rany2/edge-tts), which run online. For Romanian, macOS only has Ioana; these add Mihai (Piper) and Alina and Emil (Microsoft).
 
 ## How it works
 
 ```
-Claude Code session ──(Stop hook)──▶ ~/.claude/tts/state/replies/<session>.{md,txt,json}
+Claude Code session ──(Stop hook)────────────▶ state/replies/<session>.{md,txt,json}
+                    ──(PostToolUse hook)──────▶ state/progress/<session>/*.txt
+                    ──(/voice, /summarize…)───▶ state/commands/*.cmd, state/inbox/
                                                      │
                                                      ▼
-                                        Claude Voice app (polls the folder)
+                                        Claude Voice app (watches the folders)
                                            │                     │
-                     macOS speech synthesizer             claude CLI (summaries,
-                     (AVSpeechSynthesizer), or                on request only)
+                     macOS speech synthesizer             claude CLI (low-cost
+                     (AVSpeechSynthesizer), or            summary, on request only)
                      Python worker: Piper / edge-tts
 ```
 
-1. A Claude Code **Stop hook** (`hook/talk`) runs after every reply in every session. It saves the reply as raw markdown, a cleaned plain-text version, and metadata (project, title, transcript path). It never plays audio and never calls a model.
+1. Claude Code **hooks** (`hook/talk`) feed the app. The **Stop** hook runs after every reply in every session: it saves the reply as raw markdown, a cleaned plain-text version, and metadata (project, title, transcript path). The **PostToolUse** hook (only while "Also read progress updates" is on) saves the short text blocks Claude wrote before each tool call. The **UserPromptSubmit** hook turns `/voice …` into a command for the app without calling the model. None of them plays audio or calls a model.
 2. The **app** watches that folder, parses the markdown into display blocks and spoken sentences, and plays them with `AVSpeechSynthesizer`, one utterance per sentence. Word and sentence callbacks drive the highlight.
    - With a **Piper or Microsoft voice**, a Python worker (one per engine, kept running) turns each sentence into an audio file, several at a time, and the app plays the files. The next four sentences are made ahead, and files are cached for a week, so replays start at once. The highlighted word is estimated from the playback position. If the engine is missing or fails, that sentence is read by the best macOS voice for the language and the reader shows why.
    - The reply's language is detected with Apple's NaturalLanguage framework. If it differs from the main voice's language, the voice chosen for that language is used. The "From project" line before queued replies keeps the main voice.
-3. **Summaries** run the `claude` CLI with your Claude Code login, so they use your Claude subscription. The app removes any `ANTHROPIC_API_KEY` from these calls, so they are never billed to an API key.
-   - **Low cost:** `claude -p --model claude-haiku-5-5` on the reply text alone, with hooks, tools, memory, CLAUDE.md files and connectors switched off.
-   - **Session cost:** `claude -p --resume <session> --fork-session --no-session-persistence` with the session's own model and tools, so the request matches the session's prompt cache. The fork is not saved and your session is not changed.
-   - Every summary is checked for anything a voice would stumble over: too many words, English words with native endings (like "issue-ul"), file names, abbreviations, and words the system dictionary for the language rejects. If anything is found, one quick Haiku pass repairs it.
+3. **Summaries** come in two kinds, both through your Claude subscription (never an API key: the app removes `ANTHROPIC_API_KEY` from its calls).
+   - **Low cost:** the app runs `claude -p --model claude-haiku-5-5` on the reply text alone, with hooks, tools, memory, CLAUDE.md files and connectors switched off.
+   - **From Claude Code:** `/summarize-for-voice` runs inside your live session, so it uses the session's prompt cache and its own memory of the reply: one short turn, no tools. The Stop hook sees that this reply is a summary, keeps it away from the saved reply, and hands it to the app, which plays it. (An earlier version had the app fork the session with `claude -p --resume --fork-session`; that does not share the live session's cache and cost far more usage, so it was removed.)
+   - Every low-cost summary is checked for anything a voice would stumble over: too many words, English words with native endings (like "issue-ul"), file names, abbreviations, and words the system dictionary for the language rejects. If anything is found, one quick Haiku pass repairs it.
 
 ## Requirements
 
@@ -62,26 +67,11 @@ cd claude-code-voice
 # 1. Build and install the app to ~/Applications/Claude Voice.app
 ./build.sh
 
-# 2. Install the Stop hook
-mkdir -p ~/.claude/tts
-install -m 755 hook/talk ~/.claude/tts/talk
+# 2. Install the Claude Code side: hooks, voicectl, /voice and /summarize-for-voice
+scripts/install-integration.sh
 ```
 
-Then add the hook to `~/.claude/settings.json`. If you already have a `Stop` entry, add this object to its array instead of replacing it:
-
-```json
-{
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          { "type": "command", "command": "$HOME/.claude/tts/talk hook", "timeout": 10 }
-        ]
-      }
-    ]
-  }
-}
-```
+The script copies `hook/talk` and `hook/voicectl` to `~/.claude/tts/`, the two command files to `~/.claude/commands/`, and adds the `Stop`, `UserPromptSubmit` and `PostToolUse` hooks to `~/.claude/settings.json` without touching your other hooks. It is safe to run again, and keeps your original settings as `settings.json.bak-claude-voice`. Needs `jq`. Restart running Claude Code sessions afterwards.
 
 Optionally, install Piper and Microsoft voices (see [More voices](#more-voices)):
 
@@ -93,6 +83,26 @@ scripts/install-voices.sh en_US-lessac-medium   # or any other Piper voice
 Open the app from Finder (⇧⌘H → Applications → Claude Voice) or with `open ~/Applications/"Claude Voice.app"`. To keep it handy, right-click its Dock icon → Options → Keep in Dock, or add it under System Settings → General → Login Items.
 
 A session appears in the list after it finishes its next reply.
+
+## Control it from Claude Code
+
+Typed in any Claude Code session (also from the phone, when you drive a session on your Mac through Remote Control), so you can start, pause and skip while wearing headphones connected to the Mac:
+
+| Command | Does |
+|---|---|
+| `/voice play` (or `start`) | Read this session's latest reply. `play summary` reads its summary. |
+| `/voice pause`, `resume`, `stop` | Transport |
+| `/voice back 3`, `/voice fwd 2` | Move by sentences (default 1) |
+| `/voice prev`, `next`, `restart` | Previous reply, next reply, start of this reply |
+| `/voice auto on`, `off` | Auto-read new replies from every session |
+| `/voice progress on`, `off` | Also read progress updates |
+| `/voice speed 1.2` | Speaking speed (0.6 to 1.4) |
+| `/voice status` | What the app is doing |
+| `/summarize-for-voice [language]` | The session writes a spoken summary of its last reply; the app plays it |
+
+How a command is handled: the `UserPromptSubmit` hook recognizes `/voice …` (and plain `voice pause`), writes a command file the app picks up within a moment, and blocks the prompt, so **the model is never called and no tokens are used**. If the hook is not installed, the `/voice` command file still works, at the cost of one small model turn. The same commands work from a terminal: `~/.claude/tts/voicectl back 3`.
+
+`/summarize-for-voice` is one turn in your live session, working from the session's own memory of its last reply, so it reads from the prompt cache instead of processing the conversation again. It does not re-read files or re-analyze. Do not add `model:` to its command file: switching models loses the cache.
 
 ## Using it
 
@@ -139,12 +149,12 @@ To remove them: `uv tool uninstall piper-tts edge-tts` and delete `~/.claude/tts
 
 ## Summaries and usage
 
-Summaries are the only part that uses Claude, and only after you confirm.
+Only summaries use Claude, and only on request. Auto-read, progress reading and every `/voice` command never do.
 
-- **Low cost** sees only the reply. It takes about 5 to 10 seconds and very little of your plan's usage.
-- **Session cost** re-reads the session's conversation from its prompt cache. While that cache is warm (about an hour after the session's last activity on a subscription), it costs roughly as much as sending one short message in that session. If the cache has expired, the whole conversation is processed again, which uses several times more. The confirmation dialog shows the session's size, its model and whether its cache is likely warm.
+- **Low cost** (in the app, after you confirm) sees only the reply. It takes about 5 to 10 seconds and very little of your plan's usage.
+- **From Claude Code** (`/summarize-for-voice`) is one short turn in the session. While its prompt cache is warm (about an hour after the session's last activity on a subscription) it costs roughly as much as any short message there; if the cache expired, the conversation is processed again like for any message. The summary uses the session's own model. Models with thinking enabled may think briefly before answering.
 
-Each summary is about a fifth of the reply, between 25 and 100 words, and is cached per reply, kind and language. Changing the language, or a new reply, makes a new summary. Replies under 70 words are only offered in full.
+Each summary is about a fifth of the reply, between 25 and 100 words, and is cached per reply. A new reply makes a new summary. Replies under 70 words are only offered in full.
 
 ## Files
 
@@ -157,8 +167,14 @@ Everything lives under `~/.claude/tts/state/`:
 | `replies/<session>.json` | project, title, working folder, transcript path |
 | `heard/<session>` | marker; its date says when you last heard that session |
 | `summaries/<session>.<quick or session>.json` | cached summaries |
+| `progress/<session>/<time>-<n>.txt` | progress messages of the current or last turn |
+| `progress-enabled` | exists while "Also read progress updates" is on; the PostToolUse hook does nothing without it |
+| `commands/<time>.cmd` | commands from Claude Code, read and deleted by the app (older than 15 s are ignored) |
+| `inbox/summary-<session>.txt` | a summary written by a session, waiting for the app |
+| `pending-summary/<session>` | marks that the session's next reply is a summary |
+| `status.json` | what the app is doing, for `voicectl status` |
 
-The hook deletes files older than seven days. App settings, including hidden sessions, are stored in the `local.claude-voice` defaults domain.
+Setting `CLAUDE_VOICE_STATE` moves this whole folder (the hooks and the app both honor it; the tests use it). The hook deletes files older than seven days. App settings, including hidden sessions, are stored in the `local.claude-voice` defaults domain.
 
 Piper voices live in `~/.claude/tts/piper`. Audio made by Piper and Microsoft voices is cached in `~/Library/Caches/local.claude-voice/speech` and deleted after seven days.
 
@@ -167,15 +183,19 @@ Piper voices live in `~/.claude/tts/piper`. Audio made by Piper and Microsoft vo
 ```
 Sources/
   App.swift          app entry, window and menu bar scenes
-  Model.swift        ties it together: playing, auto-read, confirmations
+  Model.swift        ties it together: playing, auto-read, progress, commands, confirmations
+  Commands.swift     watches commands/ from Claude Code
   Speaker.swift      sentence playlist: AVSpeechSynthesizer or audio files
   Voices.swift       voices from every engine, language detection, settings
   ExternalTTS.swift  Piper / edge-tts worker process and audio cache
-  Store.swift        watches the replies folder; sentence splitting
+  Store.swift        watches the replies and progress folders; sentence splitting
   Markdown.swift     markdown → display blocks + spoken sentences
-  Summarizer.swift   summaries via the claude CLI, session info, speech check
+  Summarizer.swift   low-cost summary via the claude CLI, imported summaries, speech check
   Views.swift        SwiftUI: reader, session list, settings, menu
-hook/talk            the Claude Code Stop hook
+hook/talk            the Claude Code hooks: Stop, PostToolUse (progress), UserPromptSubmit (/voice)
+hook/voicectl        command line control of the app
+hook/commands/       the /voice and /summarize-for-voice command files
+scripts/install-integration.sh   installs the hooks, voicectl and commands
 scripts/install-voices.sh   installs Piper and edge-tts, downloads Piper voices
 scripts/make_icon.swift
 tests/               small runnable test programs (see below)
@@ -202,12 +222,21 @@ swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store}.swift tests/v
 # markdown parser
 swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown}.swift tests/markdown/main.swift -o build/mdtest && build/mdtest
 
-# summaries through the real code path (uses your Claude subscription)
+# low-cost summary through the real code path (uses your Claude subscription)
 swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer}.swift tests/summary/main.swift -o build/sumtest
-build/sumtest <session-id-for-low-cost> <session-id-for-session-summary>
+build/sumtest <session-id>
+
+# hooks and voicectl against a fixture transcript, in a throwaway HOME (no app, no Claude)
+bash tests/hook/test.sh
+
+# command inbox, pause/resume/prev, dropping stale progress (plays a moment of speech)
+swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Commands}.swift tests/commands/main.swift -o build/cmdtest && build/cmdtest
+
+# auto-read, progress and commands never start Claude (stub binary + own state folder)
+swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Commands,Model}.swift tests/autoplay/main.swift -o build/autotest && build/autotest
 
 # off-screen screenshots of the window and Settings
-swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Views,Model}.swift tests/render/main.swift -o build/render
+swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Views,Model,Commands}.swift tests/render/main.swift -o build/render
 build/render <output-folder>
 ```
 
@@ -216,7 +245,9 @@ build/render <output-folder>
 - The build is signed ad hoc, so it runs on the Mac that built it. Sharing it with others needs a Developer ID signature and notarization.
 - When the session list has keyboard focus, it may take the arrow keys and space for itself. Click in the reader to use the shortcuts.
 - The app polls the replies folder every 1.5 seconds.
-- A session summary of a session that is still working may describe its newest progress instead of its last finished reply.
+- `/voice` is intercepted by the hook only because `~/.claude/commands/voice.md` exists: an unknown slash command never reaches hooks. Plain `voice pause` (no slash) is intercepted without the file. Tested with `claude -p` on the Mac; driving a session from the phone through Remote Control has not been tested here.
+- Progress detection reads Claude Code's transcript (a text block before a tool call). The transcript format is internal and could change; the logic is one `jq` filter in `hook/talk`.
+- `/summarize-for-voice` is recognized by a short-lived marker set when the command starts. If you interrupt it, the marker is cleared by your next prompt (and expires after three minutes anyway).
 - Summaries are condensed by a model: they can leave out details. The Full tab is always one click away.
 - With Piper and Microsoft voices the highlighted word is an estimate, so it can run slightly ahead of or behind the voice.
 - Piper fails if it is installed under a very long path (espeak-ng only accepts a short data folder path). The install script's default location is fine.

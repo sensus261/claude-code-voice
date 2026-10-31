@@ -46,5 +46,5 @@ MainActor.assumeIsolated {
           Date() < end {
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
     }
-    snapshot("settings", width: 420, height: 600, SettingsView())
+    snapshot("settings", width: 420, height: 680, SettingsView())
 }

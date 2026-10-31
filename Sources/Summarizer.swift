@@ -1,11 +1,12 @@
 import AppKit
 import Foundation
 
-/// Spoken summaries, made only on explicit request, both through the user's Claude
-/// subscription (claude.ai login of the `claude` CLI):
-///  - quick:   `claude -p --model haiku` on the reply text alone (low cost)
-///  - session: `claude -p --resume <sid> --fork-session` so the session's own model
-///             summarizes with full context, reusing its prompt cache
+/// Spoken summaries, in two kinds:
+///  - quick:   made here on explicit request and confirmation: `claude -p --model haiku` on the
+///             reply text alone (low cost, through the user's Claude subscription)
+///  - session: written by the Claude Code session itself when the user runs /summarize-for-voice
+///             there (same prompt cache, no extra process). The Stop hook hands it to the app, which
+///             only stores it (`storeImported`); the app never starts a Claude call for it.
 /// Cached per reply in ~/.claude/tts/state/summaries/<sid>.<mode>.json.
 @MainActor
 final class Summarizer: ObservableObject {
@@ -21,38 +22,34 @@ final class Summarizer: ObservableObject {
 
     func cached(_ s: Session, _ mode: ReadMode) -> String? { entry(s, mode)?["text"] as? String }
 
-    /// Details saved with a session summary (tokens re-read), for display.
-    func cachedInfo(_ s: Session, _ mode: ReadMode) -> [String: Any]? { entry(s, mode) }
-
     private func entry(_ s: Session, _ mode: ReadMode) -> [String: Any]? {
         guard mode != .full,
               let data = try? Data(contentsOf: file(s.id, mode)),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let source = obj["source"] as? Double, abs(source - s.modified.timeIntervalSince1970) < 0.001,
-              obj["lang"] as? String == Languages.selected.code,
-              obj["v"] as? Int == Self.promptVersion,
               let text = obj["text"] as? String, !text.isEmpty else { return nil }
+        // Haiku summaries depend on the app's language and prompt; the session chose its own.
+        if mode == .quick, obj["lang"] as? String != Languages.selected.code || obj["v"] as? Int != Self.promptVersion {
+            return nil
+        }
         return obj
     }
 
     /// Summary of the session's current reply in the selected language; nil on failure.
+    /// Only `.quick` ever starts a Claude call; a session summary exists or it does not.
     func summary(for s: Session, _ mode: ReadMode) async -> String? {
         guard mode != .full else { return nil }
         if let c = cached(s, mode) { return c }
+        guard mode == .quick else { return nil }
         let lang = Languages.selected
         let key = "\(s.id)|\(mode.rawValue)"
         if let t = tasks[key] { return await t.value }
 
         let source = Self.source(for: s)
-        let info = mode == .session ? SessionInfo.of(s) : nil
-        if mode == .session && info == nil {
-            lastError = "this session's log was not found"
-            return nil
-        }
         working.insert(key)
         let t = Task<String?, Never> {
             var result = await Task.detached(priority: .userInitiated) { () -> Result<ClaudeCLI.Output, SummaryError> in
-                mode == .quick ? ClaudeCLI.quick(source, lang: lang) : ClaudeCLI.session(info!, reply: source, lang: lang)
+                ClaudeCLI.quick(source, lang: lang)
             }.value
             // One cheap repair pass if the text is too long or not fully in the language.
             if case .success(let out) = result {
@@ -61,7 +58,7 @@ final class Summarizer: ObservableObject {
                    case .success(let fixed) = await Task.detached(priority: .userInitiated, operation: {
                        ClaudeCLI.repair(out.text, lang: lang, problems: problems)
                    }).value {
-                    result = .success(ClaudeCLI.Output(text: fixed.text, cacheRead: out.cacheRead, cacheWrite: out.cacheWrite))
+                    result = .success(fixed)
                 }
             }
             self.tasks[key] = nil
@@ -87,14 +84,22 @@ final class Summarizer: ObservableObject {
     }
 
     private func save(_ out: ClaudeCLI.Output, for s: Session, _ mode: ReadMode, _ lang: Languages.Lang) {
+        write(out.text, for: s, mode, lang: lang.code)
+    }
+
+    private func write(_ text: String, for s: Session, _ mode: ReadMode, lang: String) {
         try? FileManager.default.createDirectory(at: Self.dir, withIntermediateDirectories: true)
-        var obj: [String: Any] = ["source": s.modified.timeIntervalSince1970, "lang": lang.code,
-                                  "v": Self.promptVersion, "text": out.text]
-        if let r = out.cacheRead { obj["cacheRead"] = r }
-        if let w = out.cacheWrite { obj["cacheWrite"] = w }
+        let obj: [String: Any] = ["source": s.modified.timeIntervalSince1970, "lang": lang,
+                                  "v": Self.promptVersion, "text": text]
         if let data = try? JSONSerialization.data(withJSONObject: obj) {
             try? data.write(to: file(s.id, mode), options: .atomic)
         }
+    }
+
+    /// A summary the Claude Code session wrote for `s`'s current reply (see /summarize-for-voice).
+    func storeImported(_ text: String, for s: Session) {
+        write(text, for: s, .session, lang: "session")
+        objectWillChange.send()
     }
 
     /// Raw markdown when the hook saved it, else the cleaned text.
@@ -105,36 +110,6 @@ final class Summarizer: ObservableObject {
     }
 }
 
-/// What the session's transcript says: where it runs, its model, context size, last activity.
-struct SessionInfo {
-    let sid: String
-    let transcript: URL
-    let cwd: String
-    let model: String?
-    let contextTokens: Int
-    let lastActivity: Date
-
-    /// Cache lifetime on a subscription is about an hour.
-    var cacheLikelyWarm: Bool { Date().timeIntervalSince(lastActivity) < 55 * 60 }
-
-    static func of(_ s: Session) -> SessionInfo? {
-        guard let t = Transcript.url(for: s.id) else { return nil }
-        let mod = (try? t.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-        var cwd = ""
-        if let h = try? FileHandle(forReadingFrom: t) {           // launch folder: first entry with a cwd
-            let head = String(decoding: h.readData(ofLength: 256 * 1024), as: UTF8.self)
-            try? h.close()
-            for line in head.split(separator: "\n") {
-                if let o = Transcript.json(line), let c = o["cwd"] as? String { cwd = c; break }
-            }
-        }
-        guard !cwd.isEmpty else { return nil }
-        let usage = Transcript.lastUsage(t)
-        return SessionInfo(sid: s.id, transcript: t, cwd: cwd, model: usage?.model,
-                           contextTokens: usage?.tokens ?? 0, lastActivity: mod)
-    }
-}
-
 struct SummaryError: Error {
     let message: String
 }
@@ -142,11 +117,13 @@ struct SummaryError: Error {
 enum ClaudeCLI {
     struct Output {
         let text: String
-        var cacheRead: Int?
-        var cacheWrite: Int?
     }
 
     static let path: String? = {
+        // Lets tests point at a stub that records whether it was ever started.
+        if let p = ProcessInfo.processInfo.environment["CLAUDE_VOICE_CLAUDE"], FileManager.default.isExecutableFile(atPath: p) {
+            return p
+        }
         let home = NSHomeDirectory()
         for p in ["\(home)/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude",
                   "\(home)/.claude/local/claude"] where FileManager.default.isExecutableFile(atPath: p) {
@@ -166,7 +143,8 @@ enum ClaudeCLI {
         return found.hasPrefix("/") ? found : nil
     }()
 
-    /// Shared by both summary kinds: the text-to-speech voice only speaks one language well.
+    /// The text-to-speech voice only speaks one language well. (hook/commands/summarize-for-voice.md
+    /// carries a copy of these rules for summaries written inside Claude Code; keep them in step.)
     static let languageRule = """
         Write entirely in the given language, the way a native speaker would say it aloud. Translate \
         technical terms into natural words of that language (in Romanian, for example: "tichetul" or \
@@ -210,7 +188,7 @@ enum ClaudeCLI {
         return run(["-p", "--model", "claude-haiku-5-5", "--no-session-persistence", "--tools", "",
                     "--strict-mcp-config", "--disable-slash-commands",
                     "--system-prompt", quickPrompt, "--settings", quickSettings],
-                   stdin: input, cwd: Paths.base, timeout: 60, json: false)
+                   stdin: input, cwd: Paths.base, timeout: 60)
     }
 
     // MARK: repair (Haiku, fixes only what SpeechCheck found)
@@ -228,33 +206,13 @@ enum ClaudeCLI {
         return run(["-p", "--model", "claude-haiku-5-5", "--no-session-persistence", "--tools", "",
                     "--strict-mcp-config", "--disable-slash-commands",
                     "--system-prompt", repairPrompt, "--settings", quickSettings],
-                   stdin: input, cwd: Paths.base, timeout: 60, json: false)
-    }
-
-    // MARK: session (fork of the session itself, full context, warm cache)
-
-    static func session(_ info: SessionInfo, reply: String, lang: Languages.Lang) -> Result<Output, SummaryError> {
-        let opening = reply.split(whereSeparator: \.isNewline).first.map { String($0.prefix(120)) } ?? ""
-        let request = """
-            Voice summary request from my text-to-speech app. Write the spoken version of your most recent \
-            reply before this message (it begins: "\(opening)"). Rules: the language is \(lang.name). \
-            \(languageRule) At most \(summaryWordLimit(reply)) words; full natural sentences, not terse; no \
-            markdown, lists, symbols or code; start with the outcome; never add anything that is not in that \
-            reply; if it asked me something or needs my decision, end with that. Do not use any tools. Output \
-            only the spoken text.
-            """
-        // Same model and tools as the session so the request matches its prompt cache.
-        var args = ["-p", "--resume", info.sid, "--fork-session", "--no-session-persistence",
-                    "--settings", #"{"disableAllHooks":true}"#, "--output-format", "json"]
-        if let m = info.model { args += ["--model", m] }
-        args.append(request)
-        return run(args, stdin: nil, cwd: URL(fileURLWithPath: info.cwd), timeout: 180, json: true)
+                   stdin: input, cwd: Paths.base, timeout: 60)
     }
 
     // MARK: process
 
-    private static func run(_ args: [String], stdin input: String?, cwd: URL, timeout: Double,
-                            json: Bool) -> Result<Output, SummaryError> {
+    private static func run(_ args: [String], stdin input: String?, cwd: URL,
+                            timeout: Double) -> Result<Output, SummaryError> {
         guard let exe = path else { return .failure(.init(message: "claude command not found")) }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: exe)
@@ -290,25 +248,14 @@ enum ClaudeCLI {
         p.waitUntilExit()
         killer.cancel()
 
-        var text = String(decoding: out, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        var result = Output(text: "")
-        if json, let o = try? JSONSerialization.jsonObject(with: out) as? [String: Any] {
-            if o["is_error"] as? Bool == true {
-                return .failure(.init(message: (o["result"] as? String) ?? "claude reported an error"))
-            }
-            text = (o["result"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if let u = o["usage"] as? [String: Any] {
-                result.cacheRead = u["cache_read_input_tokens"] as? Int
-                result.cacheWrite = u["cache_creation_input_tokens"] as? Int
-            }
-        }
+        let text = String(decoding: out, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         guard p.terminationStatus == 0, !text.isEmpty else {
             if p.terminationReason == .uncaughtSignal { return .failure(.init(message: "timed out")) }
             let err = (try? String(contentsOf: errURL, encoding: .utf8)) ?? ""
             let first = (err + "\n" + text).split(whereSeparator: \.isNewline).first.map(String.init)
             return .failure(.init(message: first ?? "claude exited with \(p.terminationStatus)"))
         }
-        return .success(Output(text: plain(text), cacheRead: result.cacheRead, cacheWrite: result.cacheWrite))
+        return .success(Output(text: plain(text)))
     }
 
     /// Strip any markdown that slipped through.
@@ -388,7 +335,7 @@ enum SpeechCheck {
     }
 }
 
-/// Shared length rule for both summary kinds: about a fifth of the reply, 25 to 100 words.
+/// Length rule for summaries: about a fifth of the reply, 25 to 100 words.
 func summaryWordLimit(_ source: String) -> Int {
     min(100, max(25, source.split(whereSeparator: \.isWhitespace).count / 5))
 }
