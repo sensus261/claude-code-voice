@@ -60,7 +60,7 @@ final class AppModel: ObservableObject {
 
     /// Every unheard reply, full text, top to bottom.
     func playAllNew() {
-        let new = store.sessions.filter(\.isNew)
+        let new = store.visible.filter(\.isNew)
         guard !new.isEmpty else { return }
         request += 1
         speaker.play(new.map { withHeader(fullItem($0), $0) })
@@ -69,7 +69,7 @@ final class AppModel: ObservableObject {
     /// Auto-read always uses the full reply: no Claude calls without a click.
     private func autoRead(_ s: Session) {
         let d = UserDefaults.standard
-        guard d.bool(forKey: "autoAll") || AutoRead.contains(d.string(forKey: "autoSids") ?? "", s.id) else { return }
+        guard !s.hidden, d.bool(forKey: "autoAll") || AutoRead.contains(d.string(forKey: "autoSids") ?? "", s.id) else { return }
         var it = fullItem(s)
         if speaker.state != .idle || lastSid != s.id { it = withHeader(it, s) }
         speaker.enqueue(it)

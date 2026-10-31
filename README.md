@@ -9,7 +9,7 @@ It lists every Claude Code session that has replied recently, shows each reply f
 ## Features
 
 - **Floating window.** Pin it above every other window, including full-screen apps. A menu bar icon keeps it running when the window is closed.
-- **All your sessions in one list.** Each session's latest reply, with project name, title, age, word count and a dot for replies you have not heard yet.
+- **All your sessions in one list.** Each session's latest reply, with project name, title, age, word count, the session's context size when it wrote that reply (like "183k ctx"), and a dot for replies you have not heard yet. Hide the sessions you don't want to see, until they reply again or for good.
 - **Reader that looks like Claude Code.** Click a session to see its reply rendered from markdown: headings, bold, inline code, links, lists, tables, quotes and code blocks. The sentence being read is highlighted. Click any block to start reading from there.
 - **Proper playback.** Play and pause, previous and next sentence, restart the reply, skip to the next reply, stop. One continuous voice, no gaps, exact sentence positions.
 - **Auto-read per session.** Turn it on for the sessions you want to hear as soon as they reply. Replies from several sessions queue up and never talk over each other.
@@ -103,7 +103,9 @@ A session appears in the list after it finishes its next reply.
 | Click a session (or ↑ ↓) | Show its reply, without speaking |
 | Double-click, Return or ▶ | Play the full reply |
 | Speaker icon | Auto-read new replies from that session (full text) |
-| Right-click | Play, play a summary, add to queue, auto-read, mark as heard, copy text |
+| Right-click | Play, play a summary, add to queue, auto-read, mark as heard, copy text, hide |
+| ⌫ or swipe left | Hide until the session replies again |
+| "N hidden" | Show hidden sessions (dimmed); right-click one to unhide it |
 | Play new | Play every unheard reply, top to bottom |
 
 **Player**
@@ -156,7 +158,7 @@ Everything lives under `~/.claude/tts/state/`:
 | `heard/<session>` | marker; its date says when you last heard that session |
 | `summaries/<session>.<quick or session>.json` | cached summaries |
 
-The hook deletes files older than seven days. App settings are stored in the `local.claude-voice` defaults domain.
+The hook deletes files older than seven days. App settings, including hidden sessions, are stored in the `local.claude-voice` defaults domain.
 
 Piper voices live in `~/.claude/tts/piper`. Audio made by Piper and Microsoft voices is cached in `~/Library/Caches/local.claude-voice/speech` and deleted after seven days.
 

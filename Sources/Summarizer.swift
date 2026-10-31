@@ -118,53 +118,20 @@ struct SessionInfo {
     var cacheLikelyWarm: Bool { Date().timeIntervalSince(lastActivity) < 55 * 60 }
 
     static func of(_ s: Session) -> SessionInfo? {
-        guard let t = transcript(for: s.id) else { return nil }
+        guard let t = Transcript.url(for: s.id) else { return nil }
         let mod = (try? t.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
         var cwd = ""
         if let h = try? FileHandle(forReadingFrom: t) {           // launch folder: first entry with a cwd
             let head = String(decoding: h.readData(ofLength: 256 * 1024), as: UTF8.self)
             try? h.close()
             for line in head.split(separator: "\n") {
-                if let o = json(line), let c = o["cwd"] as? String { cwd = c; break }
+                if let o = Transcript.json(line), let c = o["cwd"] as? String { cwd = c; break }
             }
         }
-        var model: String?
-        var tokens = 0
-        for line in tail(t, bytes: 2 * 1024 * 1024).split(separator: "\n").reversed() {   // last assistant usage
-            guard let o = json(line), o["type"] as? String == "assistant",
-                  let msg = o["message"] as? [String: Any], let u = msg["usage"] as? [String: Any] else { continue }
-            model = msg["model"] as? String
-            tokens = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
-                .reduce(0) { $0 + ((u[$1] as? Int) ?? 0) }
-            break
-        }
         guard !cwd.isEmpty else { return nil }
-        return SessionInfo(sid: s.id, transcript: t, cwd: cwd, model: model, contextTokens: tokens, lastActivity: mod)
-    }
-
-    private static func transcript(for sid: String) -> URL? {
-        let meta = Paths.replies.appendingPathComponent("\(sid).json")
-        if let d = try? Data(contentsOf: meta),
-           let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-           let p = o["transcript"] as? String, FileManager.default.fileExists(atPath: p) {
-            return URL(fileURLWithPath: p)
-        }
-        let projects = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
-        let dirs = (try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil)) ?? []
-        return dirs.map { $0.appendingPathComponent("\(sid).jsonl") }
-            .first { FileManager.default.fileExists(atPath: $0.path) }
-    }
-
-    private static func tail(_ url: URL, bytes: UInt64) -> String {
-        guard let h = try? FileHandle(forReadingFrom: url) else { return "" }
-        defer { try? h.close() }
-        let size = (try? h.seekToEnd()) ?? 0
-        try? h.seek(toOffset: size > bytes ? size - bytes : 0)
-        return String(decoding: h.readDataToEndOfFile(), as: UTF8.self)
-    }
-
-    private static func json(_ line: Substring) -> [String: Any]? {
-        try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        let usage = Transcript.lastUsage(t)
+        return SessionInfo(sid: s.id, transcript: t, cwd: cwd, model: usage?.model,
+                           contextTokens: usage?.tokens ?? 0, lastActivity: mod)
     }
 }
 

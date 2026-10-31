@@ -34,7 +34,7 @@ struct ContentView: View {
         .onChange(of: speaker.currentSid) { old, new in
             if let new, selected == nil || selected == old { selected = new }
         }
-        .onAppear { if selected == nil { selected = store.sessions.first?.id } }
+        .onAppear { if selected == nil { selected = store.visible.first?.id } }
         .alert(model.ask?.title ?? "", isPresented: Binding(
             get: { model.ask != nil }, set: { if !$0 { model.ask = nil } }), presenting: model.ask) { a in
             if a.canRun { Button("Summarize") { model.confirm(a) } }
@@ -410,15 +410,27 @@ struct SessionList: View {
     @EnvironmentObject private var store: Store
     @AppStorage("autoAll") private var autoAll = false
     @AppStorage("autoSids") private var autoSids = ""
+    @State private var showHidden = false
 
     var body: some View {
-        let newCount = store.sessions.filter(\.isNew).count
+        let shown = showHidden ? store.sessions : store.visible
+        let newCount = store.visible.filter(\.isNew).count
+        let hiddenCount = store.hiddenCount
         VStack(spacing: 0) {
             HStack {
                 Text("Sessions").font(.headline)
+                if hiddenCount > 0 {
+                    Button { showHidden.toggle() } label: {
+                        Label("\(hiddenCount) hidden", systemImage: showHidden ? "eye" : "eye.slash")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(showHidden ? Color.accentColor : Color.secondary)
+                    .help(showHidden ? "Stop showing hidden sessions" : "Show hidden sessions")
+                }
                 Spacer()
                 Button("Play new (\(newCount))") {
-                    selected = store.sessions.first(where: \.isNew)?.id
+                    selected = store.visible.first(where: \.isNew)?.id
                     AppModel.shared.playAllNew()
                 }
                 .disabled(newCount == 0)
@@ -426,23 +438,40 @@ struct SessionList: View {
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
 
-            if store.sessions.isEmpty {
+            if shown.isEmpty {
                 VStack(spacing: 6) {
                     Spacer()
-                    Text("No replies yet").foregroundStyle(.secondary)
-                    Text("They appear here when any Claude Code session finishes a turn.")
-                        .font(.caption).foregroundStyle(.tertiary).multilineTextAlignment(.center)
+                    if store.sessions.isEmpty {
+                        Text("No replies yet").foregroundStyle(.secondary)
+                        Text("They appear here when any Claude Code session finishes a turn.")
+                            .font(.caption).foregroundStyle(.tertiary).multilineTextAlignment(.center)
+                    } else {
+                        Text("All sessions are hidden").foregroundStyle(.secondary)
+                        Text("They come back when they reply again, or click \"\(hiddenCount) hidden\".")
+                            .font(.caption).foregroundStyle(.tertiary).multilineTextAlignment(.center)
+                    }
                     Spacer()
                 }
                 .padding()
             } else {
-                List(store.sessions, selection: $selected) { s in
+                List(shown, selection: $selected) { s in
                     SessionRow(session: s) {
                         selected = s.id
                         AppModel.shared.play(s)
                     }
+                    .opacity(s.hidden ? 0.55 : 1)
+                    .swipeActions {
+                        if s.hidden {
+                            Button("Unhide") { store.unhide(s.id) }.tint(.accentColor)
+                        } else {
+                            Button("Hide") { hide(s, always: false) }.tint(.gray)
+                        }
+                    }
                 }
                 .listStyle(.inset)
+                .onDeleteCommand {   // ⌫ hides the selected session until it replies again
+                    if let s = store.sessions.first(where: { $0.id == selected }), !s.hidden { hide(s, always: false) }
+                }
                 .contextMenu(forSelectionType: String.self) { ids in
                     if let id = ids.first, let s = store.sessions.first(where: { $0.id == id }) {
                         menu(s)
@@ -455,6 +484,18 @@ struct SessionList: View {
                 }
             }
         }
+        .onChange(of: hiddenCount) { _, n in if n == 0 { showHidden = false } }
+    }
+
+    /// Hide a session; if it was selected, select its neighbour in the list.
+    private func hide(_ s: Session, always: Bool) {
+        if selected == s.id, !showHidden {
+            let vis = store.visible
+            if let i = vis.firstIndex(where: { $0.id == s.id }) {
+                selected = (vis[safe: i + 1] ?? vis[safe: i - 1])?.id
+            }
+        }
+        store.hide(s, always: always)
     }
 
     @ViewBuilder private func menu(_ s: Session) -> some View {
@@ -475,6 +516,16 @@ struct SessionList: View {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(Summarizer.source(for: s), forType: .string)
         }
+        Divider()
+        if s.hidden {
+            Button("Unhide") { store.unhide(s.id) }
+            if (store.hiddenAt[s.id] ?? -1) >= 0 {
+                Button("Always Hide") { hide(s, always: true) }
+            }
+        } else {
+            Button("Hide Until Next Reply") { hide(s, always: false) }
+            Button("Always Hide") { hide(s, always: true) }
+        }
     }
 
     private func playSummary(_ s: Session, _ mode: ReadMode) {
@@ -489,6 +540,7 @@ struct SessionRow: View {
     let play: () -> Void
     @EnvironmentObject private var speaker: Speaker
     @EnvironmentObject private var summarizer: Summarizer
+    @EnvironmentObject private var store: Store
     @AppStorage("autoAll") private var autoAll = false
     @AppStorage("autoSids") private var autoSids = ""
 
@@ -505,6 +557,11 @@ struct SessionRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(session.displayProject).fontWeight(.semibold).lineLimit(1)
+                    if session.hidden {
+                        Image(systemName: "eye.slash").font(.caption).foregroundStyle(.secondary)
+                            .help((store.hiddenAt[session.id] ?? -1) < 0
+                                  ? "Always hidden" : "Hidden until it replies again")
+                    }
                     if playing {
                         Image(systemName: "waveform")
                             .foregroundStyle(.tint)
@@ -516,8 +573,10 @@ struct SessionRow: View {
             }
             Spacer(minLength: 4)
             TimelineView(.periodic(from: .now, by: 30)) { ctx in
-                Text("\(ago(session.modified, ctx.date)) · \(session.words)w")
+                Text("\(ago(session.modified, ctx.date)) · \(session.words)w"
+                     + (session.context.map { " · \(tokenCount($0)) ctx" } ?? ""))
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .help(session.context.map { "Context when this reply was written: \($0.formatted()) tokens" } ?? "")
             }
             Button { autoSids = AutoRead.toggled(autoSids, session.id) } label: {
                 Image(systemName: auto ? "speaker.wave.2.fill" : "speaker.slash")
@@ -680,7 +739,7 @@ struct MenuContent: View {
     @AppStorage("pinned") private var pinned = true
 
     var body: some View {
-        let newCount = store.sessions.filter(\.isNew).count
+        let newCount = store.visible.filter(\.isNew).count
         Button("Show Window") {
             openWindow(id: "main")
             NSApp.activate()
