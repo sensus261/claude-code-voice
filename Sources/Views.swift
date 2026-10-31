@@ -639,7 +639,11 @@ struct SettingsView: View {
     @AppStorage("allLanguages") private var allLanguages = false
     @AppStorage("matchLanguage") private var matchLanguage = true
     @AppStorage("summaryLang") private var summaryLang = "ro-RO"
+    @AppStorage("voiceControl") private var voiceControl = false
+    @AppStorage("voiceWakeWord") private var voiceWakeWord = true
+    @AppStorage("voiceSummary") private var voiceSummary = false
     @ObservedObject private var catalog = VoiceCatalog.shared
+    @ObservedObject private var voice = VoiceListener.shared
 
     private var voices: [VoiceOption] {
         let list = Voices.options(language: allLanguages ? nil : "en")
@@ -666,6 +670,38 @@ struct SettingsView: View {
                     .font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Button("Test Voice") { AppModel.shared.speaker.test() }
+            }
+            Section("Voice commands") {
+                Toggle("Listen for spoken commands", isOn: $voiceControl)
+                Toggle("Start with “Hey Claude”", isOn: $voiceWakeWord)
+                    .help("Off: the headset's mic button is the only gate, and short commands are heard without it")
+                Toggle("“Summarized” may create a summary (uses Claude Haiku)", isOn: $voiceSummary)
+                if voiceControl {
+                    LabeledContent("Status") { Text(voice.statusText).multilineTextAlignment(.trailing) }
+                    if !voice.inputDevice.isEmpty {
+                        LabeledContent("Microphone") { Text(voice.inputDevice) }
+                    }
+                    LabeledContent("Mic level") {
+                        ProgressView(value: Double(voice.level)).frame(width: 140)
+                    }
+                    LabeledContent("Heard") {
+                        Text(voice.lastHeard.isEmpty ? "nothing yet"
+                             : voice.lastHeard + (voice.lastResult.isEmpty ? "" : "  →  \(voice.lastResult)"))
+                            .lineLimit(2).multilineTextAlignment(.trailing)
+                    }
+                    if !voice.problem.isEmpty {
+                        Text(voice.problem).font(.caption).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Text(voiceWakeWord
+                     ? "Say “Hey Claude, play last response”, “…play last response summarized”, “…stop”, “…pause”, “…resume”, “…back three”, “…play last response from <project>”, “…which sessions”, “…progress on” or “…what's the status”."
+                     : "Say “play last response”, “play last response summarized”, “stop”, “pause”, “resume”, “back three”, “play last response from <project>”, “which sessions”, “progress on” or “what's the status”.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Speech is recognized on this Mac and never recorded. The microphone is whatever macOS uses as input: with a Bluetooth headset, playback sounds like a phone call while it is open. “Summarized” plays an existing summary; only when there is none does it ask Claude Haiku for one (about 5 seconds, a little of your Claude usage), and only if the last switch is on. Auto-read never does.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Section("Full text") {
                 Picker("Voice", selection: $voiceID) {
@@ -762,8 +798,10 @@ struct LanguageVoicePicker: View {
 struct MenuContent: View {
     @EnvironmentObject private var speaker: Speaker
     @EnvironmentObject private var store: Store
+    @EnvironmentObject private var voice: VoiceListener
     @Environment(\.openWindow) private var openWindow
     @AppStorage("pinned") private var pinned = true
+    @AppStorage("voiceControl") private var voiceControl = false
 
     var body: some View {
         let newCount = store.visible.filter(\.isNew).count
@@ -779,6 +817,10 @@ struct MenuContent: View {
         Button("Play New Replies (\(newCount))") { AppModel.shared.playAllNew() }
             .disabled(newCount == 0)
         Divider()
+        Toggle("Voice Commands", isOn: $voiceControl)
+        if voiceControl {
+            Text(voice.statusText).font(.caption)
+        }
         Toggle("Keep Window on Top", isOn: $pinned)
         Divider()
         Button("Quit Claude Voice") { NSApp.terminate(nil) }

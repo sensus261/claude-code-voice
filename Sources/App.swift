@@ -8,6 +8,7 @@ struct ClaudeVoiceApp: App {
     @StateObject private var speaker = AppModel.shared.speaker
     @StateObject private var summarizer = AppModel.shared.summarizer
     @StateObject private var model = AppModel.shared
+    @StateObject private var voice = VoiceListener.shared
 
     var body: some Scene {
         Window("Claude Voice", id: "main") {
@@ -16,6 +17,7 @@ struct ClaudeVoiceApp: App {
                 .environmentObject(speaker)
                 .environmentObject(summarizer)
                 .environmentObject(model)
+                .environmentObject(voice)
         }
         .defaultSize(width: 400, height: 620)
         .windowToolbarStyle(.unifiedCompact)
@@ -25,6 +27,7 @@ struct ClaudeVoiceApp: App {
                 .environmentObject(store)
                 .environmentObject(speaker)
                 .environmentObject(summarizer)
+                .environmentObject(voice)
         } label: {
             Image(systemName: speaker.state == .playing ? "waveform.circle.fill" : "waveform")
         }
@@ -32,6 +35,11 @@ struct ClaudeVoiceApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Starts listening when "Voice commands" was left on.
+        VoiceListener.shared.sync()
+    }
+
     // Closing the window keeps the app (and menu bar icon) running.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }

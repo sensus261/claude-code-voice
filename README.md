@@ -15,13 +15,14 @@ It lists every Claude Code session that has replied recently, shows each reply f
 - **Auto-read per session.** Turn it on for the sessions you want to hear as soon as they reply. Replies from several sessions queue up and never talk over each other.
 - **Progress updates.** Optionally, the short messages Claude writes between tasks ("Now checking the parser.") are read as they appear, not only the final reply, and recorded under the reply. If one has not been spoken yet when the final reply arrives, it is skipped so the reply starts right away.
 - **Control it from Claude Code.** `/voice pause`, `/voice back 3`, `/voice play` and more, typed in any session, also from your phone through Remote Control. Hook-handled commands use no model tokens. See [Control it from Claude Code](#control-it-from-claude-code).
+- **Control it by voice.** Wearing a headset connected to the Mac, say "Hey Claude, play last response" or "…play last response summarized", and also stop, pause, resume, back three, "from <project>", "which sessions", "progress on". Recognition runs on the Mac. Off until you turn it on. See [Voice commands](#voice-commands).
 - **Spoken summaries, only on request.** Three tabs per reply:
   - **Full**: the real reply, read in full.
   - **Summary (low cost)**: Claude Haiku 5.5 condenses the reply text (you confirm first).
   - **Summary (from Claude Code)**: you run `/summarize-for-voice` in the session; the session writes the summary itself from its own memory and the app reads it.
 
   Summaries are written entirely in the language you choose (Romanian by default) and read by a voice for that language.
-- **Auto-read never calls Claude.** It only plays text the hooks already saved. Every Claude call is explicit.
+- **Auto-read never calls Claude.** It only plays text the hooks already saved. Every Claude call is explicit: a click and its confirmation, or, only if you switch on "“Summarized” may create a summary" in Settings, you saying "summarized" out loud when no summary exists yet.
 - **Each reply in its own language.** A reply written in another language than the main voice (for example Romanian) is read by that language's voice.
 - **Better voices than macOS has for some languages.** Besides the macOS voices, the app can use [Piper](https://github.com/OHF-Voice/piper1-gpl) neural voices, which run offline on your Mac, and Microsoft's neural voices through [edge-tts](https://github.com/rany2/edge-tts), which run online. For Romanian, macOS only has Ioana; these add Mihai (Piper) and Alina and Emil (Microsoft).
 
@@ -103,6 +104,26 @@ Typed in any Claude Code session (also from the phone, when you drive a session 
 How a command is handled: the `UserPromptSubmit` hook recognizes `/voice …` (and plain `voice pause`), writes a command file the app picks up within a moment, and blocks the prompt, so **the model is never called and no tokens are used**. If the hook is not installed, the `/voice` command file still works, at the cost of one small model turn. The same commands work from a terminal: `~/.claude/tts/voicectl back 3`.
 
 `/summarize-for-voice` is one turn in your live session, working from the session's own memory of its last reply, so it reads from the prompt cache instead of processing the conversation again. It does not re-read files or re-analyze. Do not add `model:` to its command file: switching models loses the cache.
+
+## Voice commands
+
+For when you are away from the keyboard with a headset on: start a session, switch it on for your phone with `/remote-control`, walk away, and when the phone says the task is done, ask the Mac for the answer.
+
+Settings → **Voice commands** → "Listen for spoken commands" (also in the menu bar). The first time, macOS asks for microphone and speech-recognition access. Speech is turned into text on the Mac with Apple's on-device recognizer and is not recorded; it needs **Dictation turned on** in System Settings → Keyboard → Dictation (with it off, nothing is heard and Settings shows an orange message).
+
+| Say | Does |
+|---|---|
+| "Hey Claude, play last response" | Reads the newest reply of all sessions, with "From <project>." first when there are several |
+| "…play last response summarized" (or "play summary") | Plays the summary: the session's own, else the cached Haiku one. If there is none, "Summarized may create a summary" decides: on, it says "Summarizing." and makes one (about 5 seconds); off, it tells you there is none. Replies under 70 words are simply read |
+| "…play last response from claude voice", "…switch to api" | The newest reply of that project (a partial name is enough) |
+| "…which sessions" | Names the sessions |
+| "…stop", "pause", "resume" | Transport |
+| "…back three", "forward two", "next", "previous", "from the beginning" | Move by sentences or replies (`/voice` table above) |
+| "…progress on", "progress off", "what's the status" | Switch progress reading, or read the latest progress updates once |
+
+Saying "Hey Claude" while a reply is being read **pauses it at once**, so you can be heard and give a new command: stop, back three, play something else. If no command follows within 6 seconds, or it is not understood, the reply carries on. A chime means "Hey Claude" was heard and the command may follow (6 seconds). A low "buzz" means the words were not a command. Settings shows what the microphone is, what was heard and what it was taken for; if a command does nothing, look there first. "Start with “Hey Claude”" can be switched off if your headset's mute button is your gate: then a short bare command ("play last response", "stop") works.
+
+The Mac must stay awake with the app and the Claude Code session running. A session you started on the Mac and handed to the phone with `/remote-control` keeps running on the Mac, so its replies reach the app through the same hooks.
 
 ## Using it
 
@@ -232,12 +253,15 @@ bash tests/hook/test.sh
 # command inbox, pause/resume/prev, dropping stale progress (plays a moment of speech)
 swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Commands}.swift tests/commands/main.swift -o build/cmdtest && build/cmdtest
 
-# auto-read, progress and commands never start Claude (stub binary + own state folder)
-swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Commands,Model}.swift tests/autoplay/main.swift -o build/autotest && build/autotest
+# voice grammar and wake gate: what is heard -> what is done (no audio)
+swiftc -swift-version 5 Sources/VoiceIntent.swift tests/intent/main.swift -o build/intenttest && build/intenttest
+
+# auto-read, progress and commands never start Claude; spoken commands start it only when allowed (stub binary + own state folder)
+swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Commands,Model,VoiceIntent}.swift tests/autoplay/main.swift -o build/autotest && build/autotest
 
 # off-screen screenshots of the window and Settings
-swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Views,Model,Commands}.swift tests/render/main.swift -o build/render
-build/render <output-folder>
+swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Views,Model,Commands,VoiceIntent,VoiceListener}.swift tests/render/main.swift -o build/render
+mkdir -p <output-folder> && build/render <output-folder>
 ```
 
 ## Known limitations
@@ -245,6 +269,8 @@ build/render <output-folder>
 - The build is signed ad hoc, so it runs on the Mac that built it. Sharing it with others needs a Developer ID signature and notarization.
 - When the session list has keyboard focus, it may take the arrow keys and space for itself. Click in the reader to use the shortcuts.
 - The app polls the replies folder every 1.5 seconds.
+- Voice commands: English only. Commands are matched against a fixed list of phrases, not understood freely. The microphone is the system's default input, so with a Bluetooth headset playback drops to phone-call quality while it is open (muting the headset with its button does not close it for the Mac), and without the headset's boom macOS may switch to the MacBook's own microphone (Settings shows which one). The recognizer runs all the time while the feature is on, which costs some CPU. Wake-word recognition is only as good as the recognizer: "Hey Claude" is also accepted as "hey cloud", "iCloud" and similar. Set `defaults write local.claude-voice voiceDebug -bool true` to log what the microphone and recognizer do to `~/.claude/tts/state/voice.log` (including the text heard).
+- The build is signed ad hoc and its signature changes on every `./build.sh`, so macOS may ask again for microphone and speech access after a rebuild.
 - `/voice` is intercepted by the hook only because `~/.claude/commands/voice.md` exists: an unknown slash command never reaches hooks. Plain `voice pause` (no slash) is intercepted without the file. Tested with `claude -p` on the Mac; driving a session from the phone through Remote Control has not been tested here.
 - Progress detection reads Claude Code's transcript (a text block before a tool call). The transcript format is internal and could change; the logic is one `jq` filter in `hook/talk`.
 - `/summarize-for-voice` is recognized by a short-lived marker set when the command starts. If you interrupt it, the marker is cleared by your next prompt (and expires after three minutes anyway).
@@ -254,7 +280,7 @@ build/render <output-folder>
 
 ## Ideas
 
-- Voice commands ("stop", "back three", "from the beginning"), toggled from the window.
+- Voice commands in other languages; choosing a specific microphone instead of the system default.
 
 ## License
 

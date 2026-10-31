@@ -18,7 +18,8 @@ struct SummaryAsk: Identifiable {
 ///
 /// No LLM call is ever made automatically. The automatic paths (`autoRead`, `autoReadProgress`)
 /// only queue text the hooks already saved. The one Claude call this app can start is the Haiku
-/// summary (`Summarizer.summary(.quick)`), and only behind the confirmation alert.
+/// summary (`Summarizer.summary(.quick)`), and only on an explicit request: the confirmation alert,
+/// or the user saying "summarized" to the headset while "voiceSummary" is on (default off).
 @MainActor
 final class AppModel: ObservableObject {
     static let shared = AppModel()
@@ -231,6 +232,127 @@ final class AppModel: ObservableObject {
             request += 1
             speaker.play([PlayItem(sid: "_note", lines: ["There is no summary for this reply yet."])])
         }
+    }
+
+    // MARK: spoken commands (VoiceListener -> VoiceIntent)
+
+    /// Run what the user said into the headset. Transport commands share `run(_:)` with `/voice`.
+    func runVoice(_ intent: VoiceIntent) {
+        switch intent {
+        case .pause: run(VoiceCommand(action: "pause"))
+        case .resume: run(VoiceCommand(action: "resume"))
+        case .stop: run(VoiceCommand(action: "stop"))
+        case .restart: run(VoiceCommand(action: "restart"))
+        case .next: run(VoiceCommand(action: "next"))
+        case .previous: run(VoiceCommand(action: "prev"))
+        case .back(let n): run(VoiceCommand(action: "back", arg: String(n)))
+        case .forward(let n): run(VoiceCommand(action: "fwd", arg: String(n)))
+        case .progress(let on):
+            run(VoiceCommand(action: "progress", arg: on ? "on" : "off"))
+            speakNote(on ? "Progress updates on." : "Progress updates off.")
+        case .play(let summary, let project): playLast(summary: summary, project: project)
+        case .status: speakStatus()
+        case .listSessions: speakSessions()
+        }
+    }
+
+    /// "Play last response [summarized] [from <project>]": the newest reply of all sessions, or of the
+    /// session named. A summary comes from the cache; when there is none, Haiku makes one, but only
+    /// because the user asked for it out loud AND turned on "voiceSummary". Never from auto-read.
+    private func playLast(summary: Bool, project: String?) {
+        let target: Session?
+        if let project {
+            target = resolveSession(named: project)
+            if target == nil { speakNote("No session called \(project)."); return }
+        } else {
+            target = store.visible.first
+        }
+        guard let s = target else { speakNote("No replies yet."); return }
+
+        guard summary, s.words >= Self.summaryMinWords else {
+            play(s, header: shouldAnnounce(s))
+            return
+        }
+        if summarizer.cached(s, .session) != nil {
+            play(s, mode: .session, header: shouldAnnounce(s))
+        } else if summarizer.cached(s, .quick) != nil {
+            play(s, mode: .quick, header: shouldAnnounce(s))
+        } else if UserDefaults.standard.bool(forKey: "voiceSummary") {
+            speakNote("Summarizing.")       // bumps `request`; a newer command makes `r` stale
+            let r = request
+            Task {
+                let text = await summarizer.summary(for: s, .quick)
+                guard r == request else { return }       // the user asked for something else meanwhile
+                guard let text else { speakNote("I could not make a summary."); return }
+                speaker.play([announced(summaryItem(s, text, .quick), s)])
+            }
+        } else {
+            speakNote("There is no summary yet. Turn on summaries by voice in settings.")
+        }
+    }
+
+    private func play(_ s: Session, mode: ReadMode = .full, header: Bool) {
+        request += 1
+        let r = request
+        guard mode != .full else {
+            speaker.play([header ? withHeader(fullItem(s), s) : fullItem(s)])
+            return
+        }
+        Task {
+            guard let text = await summarizer.summary(for: s, mode), r == request else { return }
+            let it = summaryItem(s, text, mode)
+            speaker.play([header ? withHeader(it, s) : it])
+        }
+    }
+
+    private func announced(_ it: PlayItem, _ s: Session) -> PlayItem { shouldAnnounce(s) ? withHeader(it, s) : it }
+
+    /// Say whose reply it is when there are several sessions, because the listener cannot see the window.
+    private func shouldAnnounce(_ s: Session) -> Bool { store.visible.count > 1 }
+
+    /// The visible session whose project or title best matches what was said ("claude voice", "api").
+    /// Ties go to the newest reply. Words are compared as the grammar writes them (`VoiceGrammar.normalize`).
+    func resolveSession(named name: String) -> Session? {
+        let want = Set(VoiceGrammar.normalize(name))
+        guard !want.isEmpty else { return nil }
+        var best: (score: Int, session: Session)?
+        for s in store.visible {    // newest first, so a tie keeps the newer session
+            let have = Set(VoiceGrammar.normalize(s.project))
+            let inTitle = Set(VoiceGrammar.normalize(s.title))
+            let score = want.intersection(have).count * 2 + want.intersection(inTitle).count
+            guard score > 0, want.isSubset(of: have.union(inTitle)) else { continue }
+            if best == nil || score > best!.score { best = (score, s) }
+        }
+        return best?.session
+    }
+
+    /// The saved progress updates of the newest session, read once.
+    private func speakStatus() {
+        guard let s = store.visible.first else { speakNote("No sessions yet."); return }
+        let notes = store.progress[s.id] ?? []
+        guard !notes.isEmpty else {
+            speakNote("No progress updates. Say progress on, and I will record them.")
+            return
+        }
+        request += 1
+        var lines: [String] = []
+        for n in notes.suffix(3) { lines += Sentences.split(n.text) }
+        speaker.play([PlayItem(sid: s.id, lines: lines, voiceID: Voices.replyVoiceID(for: notes.last?.text ?? ""),
+                               isProgress: true)])
+    }
+
+    private func speakSessions() {
+        let names = store.visible.map { $0.displayProject.replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ") }
+        guard !names.isEmpty else { speakNote("No sessions yet."); return }
+        let list = names.prefix(6).joined(separator: ", ")
+        speakNote("\(names.count) session\(names.count == 1 ? "" : "s"): \(list).")
+    }
+
+    /// A short spoken answer that is not a reply (confirmations, errors).
+    func speakNote(_ text: String) {
+        request += 1
+        speaker.play([PlayItem(sid: "_note", lines: [text])])
     }
 
     /// The session wrote its own summary (/summarize-for-voice): keep it, and read it now. The user

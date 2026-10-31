@@ -1,5 +1,5 @@
 // Off-screen UI snapshot (no Screen Recording permission needed).
-// swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Views,Model}.swift tests/render/main.swift
+// swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Views,Model,Commands,VoiceIntent,VoiceListener}.swift tests/render/main.swift
 import AppKit
 import SwiftUI
 
