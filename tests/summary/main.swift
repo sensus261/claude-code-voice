@@ -1,4 +1,4 @@
-// Summarizer test: swiftc -swift-version 5 Sources/{Speaker,Store,Markdown,Summarizer}.swift tests/summary/main.swift
+// Summarizer test: swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer}.swift tests/summary/main.swift
 // Run like a Finder-launched app: env -i HOME=$HOME USER=$USER LOGNAME=$USER TMPDIR=$TMPDIR PATH=/usr/bin:/bin ./build/sumtest [quick-sid] [session-sid]
 import Foundation
 

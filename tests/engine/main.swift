@@ -1,4 +1,4 @@
-// Engine test: swiftc -swift-version 5 Sources/Speaker.swift Sources/Store.swift tests/engine/main.swift
+// Engine test: swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store}.swift tests/engine/main.swift
 import AVFoundation
 import Foundation
 
@@ -9,7 +9,7 @@ func show(_ sp: Speaker, _ label: String) {
     print("\(label): state=\(sp.state) index=\(sp.index)/\(sp.lines.count) word=\(sp.word.map { "\($0.location)" } ?? "-")")
 }
 
-print("voices: \(Voices.all.count), preferred: \(Voices.preferred.map(Voices.label) ?? "nil") [\(Voices.preferred?.language ?? "")]")
+print("voices: \(Voices.apple.count), preferred: \(Voices.preferred.map(Voices.label) ?? "nil") [\(Voices.preferred?.language ?? "")]")
 print("split: \(Sentences.split("Fix done. Run tests next.\nSee auth.ts e.g. here. 3 files changed!"))")
 
 let sp = Speaker()

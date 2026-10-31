@@ -1,4 +1,4 @@
-// Markdown parser test: swiftc -swift-version 5 Sources/{Speaker,Store,Markdown}.swift tests/markdown/main.swift
+// Markdown parser test: swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown}.swift tests/markdown/main.swift
 import Foundation
 
 let sample = """

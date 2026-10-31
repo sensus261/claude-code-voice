@@ -250,6 +250,14 @@ struct Reader: View {
                 Text("Summarizing \(names.isEmpty ? "reply" : names.joined(separator: ", "))…")
                     .font(.caption).foregroundStyle(.secondary)
             }
+        } else if let err = speaker.engineError {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                Text(err).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                Spacer()
+                Button { speaker.engineError = nil } label: { Image(systemName: "xmark") }
+                    .buttonStyle(.borderless).font(.caption)
+            }
         } else if let err = summarizer.lastError {
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
@@ -548,48 +556,63 @@ struct SettingsView: View {
     @AppStorage("rate") private var rate = Double(AVSpeechUtteranceDefaultSpeechRate)
     @AppStorage("autoAll") private var autoAll = false
     @AppStorage("allLanguages") private var allLanguages = false
+    @AppStorage("matchLanguage") private var matchLanguage = true
     @AppStorage("summaryLang") private var summaryLang = "ro-RO"
-    @AppStorage("summaryVoiceID") private var summaryVoiceID = ""
+    @ObservedObject private var catalog = VoiceCatalog.shared
 
-    private var voices: [AVSpeechSynthesisVoice] {
-        let list = allLanguages ? Voices.all : Voices.all.filter { $0.language.hasPrefix("en") }
-        if let sel = Voices.selected, !list.contains(where: { $0.identifier == sel.identifier }) {
-            return [sel] + list
+    private var voices: [VoiceOption] {
+        let list = Voices.options(language: allLanguages ? nil : "en")
+        if !voiceID.isEmpty, !list.contains(where: { $0.id == voiceID }) {
+            return [Voices.option(id: voiceID)] + list
         }
         return list
-    }
-
-    private var summaryVoices: [AVSpeechSynthesisVoice] {
-        Voices.all.filter { $0.language.hasPrefix(String(summaryLang.prefix(2))) }
     }
 
     var body: some View {
         Form {
             Section("Full text") {
                 Picker("Voice", selection: $voiceID) {
-                    ForEach(voices, id: \.identifier) { v in
-                        Text("\(Voices.label(v))  \(v.language)").tag(v.identifier)
-                    }
+                    ForEach(voices) { v in Text("\(v.label)  \(v.language)").tag(v.id) }
                 }
                 Toggle("Show all languages", isOn: $allLanguages)
+                Toggle("Read each reply in its own language", isOn: $matchLanguage)
+                    .help("A reply written in another language is read by that language's voice")
             }
             Section("Summaries") {
                 Picker("Language", selection: $summaryLang) {
                     ForEach(Languages.all, id: \.code) { l in Text(l.native).tag(l.code) }
                 }
-                .onChange(of: summaryLang) { _, _ in summaryVoiceID = "" }
-                Picker("Voice", selection: $summaryVoiceID) {
-                    Text("Automatic (best installed)").tag("")
-                    ForEach(summaryVoices, id: \.identifier) { v in Text(Voices.label(v)).tag(v.identifier) }
-                }
-                if summaryVoices.isEmpty {
-                    Text("No voice installed for this language: add one in System Settings → Accessibility → Spoken Content → Manage Voices.")
-                        .font(.caption2).foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                LanguageVoicePicker(lang: summaryLang).id(summaryLang)
                 Text("Summaries are made only when you ask and confirm, through your Claude subscription. Low cost: Claude Haiku 5.5 reads only the reply. Session cost: the session itself summarizes with full context (about one short message there while its cache is warm).")
                     .font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            Section("More voices") {
+                LabeledContent("Piper (offline)") {
+                    Text(catalog.python[.piper] == nil ? "not installed"
+                         : catalog.piper.isEmpty ? "no voices downloaded"
+                         : "\(catalog.piper.count) voice\(catalog.piper.count == 1 ? "" : "s")")
+                }
+                LabeledContent("Microsoft neural (online)") {
+                    Text(catalog.python[.edge] == nil ? "not installed"
+                         : catalog.edge.isEmpty ? "loading voices…" : "\(catalog.edge.count) voices")
+                }
+                Text("Install both with scripts/install-voices.sh from the Claude Voice folder. Piper runs on this Mac. Microsoft voices send each sentence to Microsoft's online speech service, so they are never chosen automatically.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Open Piper Folder") {
+                        try? FileManager.default.createDirectory(at: VoiceCatalog.piperDir, withIntermediateDirectories: true)
+                        NSWorkspace.shared.open(VoiceCatalog.piperDir)
+                    }
+                    Spacer()
+                    if catalog.scanning { ProgressView().controlSize(.small) }
+                    Button("Rescan") {
+                        ExternalTTS.shared.clearFailures()
+                        catalog.refresh()
+                    }
+                    .disabled(catalog.scanning)
+                }
             }
             Section("Playback") {
                 LabeledContent("Speed") {
@@ -604,10 +627,47 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 400, height: 520)
+        .frame(width: 420, height: 600)
         .onAppear {
-            if voiceID.isEmpty { voiceID = Voices.selected?.identifier ?? "" }
+            if voiceID.isEmpty { voiceID = Voices.mainID }
         }
+    }
+}
+
+/// The voice for one language: used for summaries and for replies written in it.
+struct LanguageVoicePicker: View {
+    let lang: String
+    @AppStorage private var choice: String
+    @AppStorage("matchLanguage") private var matchLanguage = true
+    @ObservedObject private var catalog = VoiceCatalog.shared
+
+    init(lang: String) {
+        self.lang = lang
+        _choice = AppStorage(wrappedValue: "", "voice.\(lang.prefix(2))")
+    }
+
+    var body: some View {
+        let prefix = String(lang.prefix(2))
+        let options = Voices.options(language: prefix)
+        let auto = Voices.automatic(prefix)
+        HStack {
+            Picker("Voice", selection: $choice) {
+                Text("Automatic (\(auto.map { $0.label.components(separatedBy: " · ")[0] } ?? "none"))").tag("")
+                ForEach(options) { v in Text(v.label).tag(v.id) }
+                if !choice.isEmpty, !options.contains(where: { $0.id == choice }) {
+                    Text(Voices.option(id: choice).label).tag(choice)
+                }
+            }
+            Button("Test") {
+                AppModel.shared.speaker.test(voiceID: Voices.id(forLanguage: lang), text: Languages.lang(lang).sample)
+            }
+            .disabled(options.isEmpty)
+        }
+        Text(options.isEmpty
+             ? "No voice installed for this language: add one in System Settings → Accessibility → Spoken Content → Manage Voices, or a Piper voice (below)."
+             : matchLanguage ? "Also reads replies written in \(Languages.lang(lang).native)." : "")
+            .font(.caption2).foregroundStyle(options.isEmpty ? .orange : .secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 

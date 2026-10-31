@@ -31,6 +31,8 @@ final class AppModel: ObservableObject {
     private var request = 0   // the newest explicit play request wins
 
     private init() {
+        Voices.migrate()
+        VoiceCatalog.shared.refresh()
         speaker.onItemStart = { [weak self] sid in
             self?.store.markHeard(sid)
             self?.lastSid = sid
@@ -136,8 +138,9 @@ final class AppModel: ObservableObject {
 
     // MARK: items
 
+    /// The full reply, read by the voice for its language when that differs from the main voice.
     func fullItem(_ s: Session) -> PlayItem {
-        PlayItem(sid: s.id, lines: ReplyDoc.of(s).lines)
+        PlayItem(sid: s.id, lines: ReplyDoc.of(s).lines, voiceID: Voices.replyVoiceID(for: s.text))
     }
 
     private func summaryItem(_ s: Session, _ text: String, _ mode: ReadMode) -> PlayItem {

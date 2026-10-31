@@ -1,5 +1,5 @@
 // Off-screen UI snapshot (no Screen Recording permission needed).
-// swiftc -swift-version 5 Sources/{Speaker,Store,Markdown,Summarizer,Views,Model}.swift tests/render/main.swift
+// swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Views,Model}.swift tests/render/main.swift
 import AppKit
 import SwiftUI
 
@@ -11,13 +11,13 @@ MainActor.assumeIsolated {
     let model = AppModel.shared
     model.speaker.onItemStart = nil            // don't mark real sessions heard
 
-    func snapshot(_ name: String) {
-        let host = NSHostingView(rootView: ContentView()
+    @MainActor func snapshot<V: View>(_ name: String, width: CGFloat = 420, height: CGFloat = 640, _ view: V) {
+        let host = NSHostingView(rootView: view
             .environmentObject(model.store)
             .environmentObject(model.speaker)
             .environmentObject(model.summarizer)
             .environmentObject(model))
-        host.frame = NSRect(x: 0, y: 0, width: 420, height: 640)
+        host.frame = NSRect(x: 0, y: 0, width: width, height: height)
         let win = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
         win.appearance = NSAppearance(named: .aqua)   // dark text vanishes on this capture's white backing
         win.contentView = host
@@ -37,6 +37,14 @@ MainActor.assumeIsolated {
         model.speaker.speak(at: 2)
         model.speaker.togglePause()
     }
-    snapshot("full")
+    snapshot("full", ContentView())
     model.speaker.stop()
+
+    // Settings, once the Piper and Microsoft voices have been looked up.
+    let end = Date().addingTimeInterval(20)
+    while VoiceCatalog.shared.scanning || (VoiceCatalog.shared.python[.edge] != nil && VoiceCatalog.shared.edge.isEmpty),
+          Date() < end {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+    }
+    snapshot("settings", width: 420, height: 600, SettingsView())
 }

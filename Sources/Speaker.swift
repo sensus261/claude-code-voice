@@ -12,19 +12,22 @@ struct PlayItem {
     let lines: [String]
     var mode: ReadMode = .full
     var voiceID: String?        // nil = main voice
-    var headerLines = 0         // spoken "From <project>." lines before the reply
+    var headerLines = 0         // spoken "From <project>." lines before the reply (main voice)
 }
 
-/// A sentence in the playlist. `id` is its position in the whole playlist.
+/// A sentence in the playlist. `id` is its position in the whole playlist, `local` in its reply.
 struct Line: Identifiable {
     let id: Int
     let item: Int
+    let local: Int
     let text: String
 }
 
-/// Plays a playlist of sentences, one utterance per sentence, so it always
+/// Plays a playlist of sentences, one utterance (or audio file) per sentence, so it always
 /// knows the exact sentence and word being spoken (back/next/skip are exact).
-final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
+/// Apple voices speak through AVSpeechSynthesizer; Piper and Microsoft voices come from
+/// ExternalTTS as audio files, with the next sentences made ahead of time.
+final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelegate {
     enum State { case idle, playing, paused }
 
     @Published private(set) var items: [PlayItem] = []
@@ -32,6 +35,8 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published private(set) var index = 0          // == lines.count when finished
     @Published private(set) var state: State = .idle
     @Published private(set) var word: NSRange?     // word being spoken in lines[index]
+    /// Last problem with a Piper or Microsoft voice (playback went on with an Apple voice).
+    @Published var engineError: String?
 
     /// Called when playback reaches the first sentence of a reply.
     var onItemStart: ((String) -> Void)?
@@ -40,8 +45,15 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private(set) var generation = 0
 
     private let synth = AVSpeechSynthesizer()
-    private var current: AVSpeechUtterance?
+    private var current: AVSpeechUtterance?        // Apple voice speaking
+    private var player: AVAudioPlayer?             // external audio for lines[index]
+    private var wordTimer: Timer?
+    private var timings: WordTimings?
+    private var token = 0                          // bumped on every sentence change
     private var startedItem: Int?
+
+    /// Sentences made ahead for Piper and Microsoft voices.
+    static let prefetch = 4
 
     override init() {
         super.init()
@@ -82,6 +94,8 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         append(item)
         if state == .idle {
             speak(at: lines.firstIndex { $0.item == items.count - 1 } ?? lines.count)
+        } else {
+            prefetch(after: index)
         }
     }
 
@@ -90,7 +104,9 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         let n = items.count
         let base = lines.count
         items.append(item)
-        lines += item.lines.enumerated().map { Line(id: base + $0.offset, item: n, text: $0.element) }
+        lines += item.lines.enumerated().map {
+            Line(id: base + $0.offset, item: n, local: $0.offset, text: $0.element)
+        }
     }
 
     // MARK: transport
@@ -107,23 +123,30 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         startedItem = lines[i].item
         index = i
         word = nil
-        let u = AVSpeechUtterance(string: lines[i].text)
-        u.voice = Voices.voice(id: items[lines[i].item].voiceID)
-        u.rate = Settings.rate
-        current = u
-        synth.speak(u)
         state = .playing
+        switch Voices.resolve(voiceID(i)) {
+        case .apple(let v): speakApple(i, v)
+        case .external(let v): speakExternal(i, v)
+        }
+        prefetch(after: i)
         if startsItem { onItemStart?(items[lines[i].item].sid) }
     }
 
     func togglePause() {
         switch state {
         case .playing:
-            synth.pauseSpeaking(at: .word)
+            if current != nil { synth.pauseSpeaking(at: .word) } else { player?.pause() }
             state = .paused
         case .paused:
-            synth.continueSpeaking()
-            state = .playing
+            if current != nil {
+                synth.continueSpeaking()
+                state = .playing
+            } else if let p = player {
+                p.play()
+                state = .playing
+            } else {
+                speak(at: index)                     // its audio never arrived: ask again
+            }
         case .idle:
             if lines.indices.contains(index) {
                 speak(at: index)                     // resume after stop
@@ -157,13 +180,90 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         speak(at: lines.firstIndex { $0.item > it } ?? lines.count)
     }
 
-    func test() {
-        play([PlayItem(sid: "_test", lines: ["This is how I will read Claude's replies."])])
+    /// Say a sample with a voice (nil = the main voice).
+    func test(voiceID: String? = nil, text: String = "This is how I will read Claude's replies.") {
+        play([PlayItem(sid: "_test", lines: [text], voiceID: voiceID)])
+    }
+
+    // MARK: engines
+
+    /// The reply's voice, except for the "From <project>." header, which uses the main voice.
+    private func voiceID(_ i: Int) -> String? {
+        let l = lines[i]
+        let item = items[l.item]
+        return l.local < item.headerLines ? nil : item.voiceID
+    }
+
+    private func speakApple(_ i: Int, _ v: AVSpeechSynthesisVoice?) {
+        let u = AVSpeechUtterance(string: lines[i].text)
+        u.voice = v
+        u.rate = Settings.rate
+        current = u
+        synth.speak(u)
+    }
+
+    private func speakExternal(_ i: Int, _ v: ExternalVoice) {
+        let t = token
+        let text = lines[i].text
+        ExternalTTS.shared.audio(text, voice: v, speed: Settings.speed) { [weak self] r in
+            guard let self, t == self.token else { return }   // moved on meanwhile
+            switch r {
+            case .success(let url):
+                if self.playFile(url, text) { return }
+                try? FileManager.default.removeItem(at: url)
+                self.fallBack(i, v, "could not play its audio")
+            case .failure(let f):
+                self.fallBack(i, v, f.message)
+            }
+        }
+    }
+
+    /// Say the sentence with the best Apple voice for its language instead.
+    private func fallBack(_ i: Int, _ v: ExternalVoice, _ why: String) {
+        engineError = "\(v.engine.title) voice: \(why). Using an Apple voice for now."
+        guard state == .playing else { return }   // paused: resuming asks again
+        speakApple(i, Voices.bestApple(for: v.language) ?? Voices.mainApple)
+    }
+
+    private func playFile(_ url: URL, _ text: String) -> Bool {
+        guard let p = try? AVAudioPlayer(contentsOf: url), p.duration > 0 else { return false }
+        p.delegate = self
+        p.prepareToPlay()
+        player = p
+        timings = WordTimings(text)
+        wordTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+        if state == .playing { p.play() }
+        return true
+    }
+
+    /// Estimates the spoken word from the playback position (external engines give no word events).
+    private func tick() {
+        guard let p = player, p.isPlaying, let t = timings else { return }
+        let w = t.word(at: p.currentTime / p.duration)
+        if w != word { word = w }
+    }
+
+    private func prefetch(after i: Int) {
+        guard i + 1 < lines.count else { return }
+        let speed = Settings.speed
+        for j in (i + 1)...min(i + Self.prefetch, lines.count - 1) {
+            if case .external(let v) = Voices.resolve(voiceID(j)) {
+                ExternalTTS.shared.audio(lines[j].text, voice: v, speed: speed)
+            }
+        }
     }
 
     private func stopSynth() {
+        token += 1
         current = nil
         if synth.isSpeaking || synth.isPaused { synth.stopSpeaking(at: .immediate) }
+        player?.stop()
+        player = nil
+        wordTimer?.invalidate()
+        wordTimer = nil
+        timings = nil
     }
 
     // MARK: AVSpeechSynthesizerDelegate (any thread -> main)
@@ -182,90 +282,39 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             self.word = r
         }
     }
-}
 
-/// Languages offered for summaries (Romanian by default).
-enum Languages {
-    struct Lang: Hashable { let code: String; let name: String; let native: String }
+    // MARK: AVAudioPlayerDelegate
 
-    static let all: [Lang] = [
-        Lang(code: "ro-RO", name: "Romanian", native: "Română"),
-        Lang(code: "en-US", name: "English", native: "English"),
-        Lang(code: "fr-FR", name: "French", native: "Français"),
-        Lang(code: "de-DE", name: "German", native: "Deutsch"),
-        Lang(code: "es-ES", name: "Spanish", native: "Español"),
-        Lang(code: "it-IT", name: "Italian", native: "Italiano"),
-        Lang(code: "pt-PT", name: "Portuguese", native: "Português"),
-        Lang(code: "nl-NL", name: "Dutch", native: "Nederlands"),
-        Lang(code: "pl-PL", name: "Polish", native: "Polski"),
-        Lang(code: "hu-HU", name: "Hungarian", native: "Magyar"),
-    ]
-
-    static var selected: Lang {
-        let code = UserDefaults.standard.string(forKey: "summaryLang") ?? "ro-RO"
-        return all.first { $0.code == code } ?? all[0]
-    }
-}
-
-enum Settings {
-    static var rate: Float {
-        let r = UserDefaults.standard.double(forKey: "rate")
-        return r == 0 ? AVSpeechUtteranceDefaultSpeechRate : Float(r)
-    }
-}
-
-enum Voices {
-    /// Installed voices, best quality first, novelty voices removed.
-    static let all: [AVSpeechSynthesisVoice] = AVSpeechSynthesisVoice.speechVoices()
-        .filter { !$0.voiceTraits.contains(.isNoveltyVoice) }
-        .sorted {
-            $0.quality.rawValue != $1.quality.rawValue
-                ? $0.quality.rawValue > $1.quality.rawValue
-                : $0.name < $1.name
+    func audioPlayerDidFinishPlaying(_ p: AVAudioPlayer, successfully flag: Bool) {
+        DispatchQueue.main.async {
+            guard p === self.player else { return }
+            self.speak(at: self.index + 1)
         }
-
-    /// Evan (Enhanced) if installed, else the best US English voice.
-    static let preferred: AVSpeechSynthesisVoice? =
-        all.first { $0.name.hasPrefix("Evan") && $0.quality != .default }
-        ?? all.first { $0.language == "en-US" && $0.quality != .default }
-        ?? AVSpeechSynthesisVoice(language: "en-US")
-
-    private static var cache: (id: String, voice: AVSpeechSynthesisVoice?)?
-
-    static var selected: AVSpeechSynthesisVoice? {
-        let id = UserDefaults.standard.string(forKey: "voiceID") ?? ""
-        if id.isEmpty { return preferred }
-        if let c = cache, c.id == id { return c.voice }
-        let v = AVSpeechSynthesisVoice(identifier: id) ?? preferred
-        cache = (id, v)
-        return v
     }
 
-    /// A specific voice by identifier, or the main voice for nil/unknown ids.
-    static func voice(id: String?) -> AVSpeechSynthesisVoice? {
-        guard let id, !id.isEmpty else { return selected }
-        return AVSpeechSynthesisVoice(identifier: id) ?? selected
+    func audioPlayerDecodeErrorDidOccur(_ p: AVAudioPlayer, error: Error?) {
+        audioPlayerDidFinishPlaying(p, successfully: false)
+    }
+}
+
+/// Where each word of a sentence starts, as a fraction of its audio, weighted by word length.
+struct WordTimings {
+    private let ranges: [NSRange]
+    private let starts: [Double]
+
+    private static let words = try! NSRegularExpression(pattern: #"\S+"#)
+
+    init(_ text: String) {
+        ranges = Self.words.matches(in: text, range: NSRange(location: 0, length: (text as NSString).length))
+            .map(\.range)
+        let weights = ranges.map { Double($0.length) + 2 }   // + the pause after each word
+        let total = max(1, weights.reduce(0, +))
+        var acc = 0.0
+        starts = weights.map { w in defer { acc += w }; return acc / total }
     }
 
-    /// Best installed voice for a language code like "ro-RO" (matches on "ro").
-    static func best(for lang: String) -> AVSpeechSynthesisVoice? {
-        let prefix = String(lang.prefix(2))
-        return all.first { $0.language == lang } ?? all.first { $0.language.hasPrefix(prefix) }
-    }
-
-    /// Voice used for summaries: the one picked in Settings, else the best for the language.
-    static func summaryVoiceID() -> String? {
-        let d = UserDefaults.standard
-        if let id = d.string(forKey: "summaryVoiceID"), !id.isEmpty { return id }
-        return best(for: Languages.selected.code)?.identifier
-    }
-
-    static func label(_ v: AVSpeechSynthesisVoice) -> String {
-        if v.name.contains("(") { return v.name }   // macOS names already say "(Enhanced)"
-        switch v.quality {
-        case .premium: return "\(v.name) (Premium)"
-        case .enhanced: return "\(v.name) (Enhanced)"
-        default: return v.name
-        }
+    func word(at fraction: Double) -> NSRange? {
+        guard let k = starts.lastIndex(where: { $0 <= fraction }) else { return ranges.first }
+        return ranges[k]
     }
 }
