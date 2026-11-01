@@ -37,6 +37,65 @@ enum Paths {
     static let progressFlag = base.appendingPathComponent("progress-enabled")
     /// What the app is doing, for `voicectl status`.
     static let status = base.appendingPathComponent("status.json")
+    /// Exists (and is touched every few seconds) while "Answer Claude by voice" is on: the Stop hook
+    /// `talk wait` arms only then, and only while the app is alive to deliver an answer.
+    static let talkbackFlag = base.appendingPathComponent("talkback-enabled")
+    /// One file per session whose Claude Code is waiting for a spoken answer: waiting/<sid>.json (hook/talk).
+    static let waiting = base.appendingPathComponent("waiting")
+    /// The answer the app wants delivered to a session: reply-in/<sid>.txt, picked up by that session's waiter.
+    static let replyIn = base.appendingPathComponent("reply-in")
+}
+
+/// Sessions that are idle and waiting for a spoken answer: an armed `talk wait` hook. The hook removes
+/// its file when it ends normally; a killed one leaves it behind, so the processes are checked too.
+enum Waiters {
+    static func isAlive(_ pid: Int) -> Bool {
+        pid > 0 && (kill(pid_t(pid), 0) == 0 || errno == EPERM)
+    }
+
+    /// True when `sid`'s session is waiting for an answer right now.
+    static func armed(_ sid: String, dir: URL = Paths.waiting) -> Bool {
+        let file = dir.appendingPathComponent("\(sid).json")
+        guard let data = try? Data(contentsOf: file),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        let waiter = (obj["pid"] as? Int) ?? 0
+        let claude = (obj["claude"] as? Int) ?? 0
+        return isAlive(waiter) && isAlive(claude)
+    }
+
+    /// Sessions waiting right now, in no particular order.
+    static func all(dir: URL = Paths.waiting) -> [String] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        return files.filter { $0.pathExtension == "json" && !$0.lastPathComponent.hasPrefix(".") }
+            .map { $0.deletingPathExtension().lastPathComponent }
+            .filter { armed($0, dir: dir) }
+    }
+
+    /// Hand an answer to the session's waiter: tmp + rename, so the hook never reads half of it.
+    @discardableResult
+    static func deliver(_ text: String, to sid: String, dir: URL = Paths.replyIn) -> Bool {
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let tmp = dir.appendingPathComponent(".\(sid).\(UUID().uuidString).tmp")
+            try text.write(to: tmp, atomically: false, encoding: .utf8)
+            let dest = dir.appendingPathComponent("\(sid).txt")
+            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            try fm.moveItem(at: tmp, to: dest)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// The answer is still lying there: nobody took it.
+    static func pending(_ sid: String, dir: URL = Paths.replyIn) -> Bool {
+        FileManager.default.fileExists(atPath: dir.appendingPathComponent("\(sid).txt").path)
+    }
+
+    static func withdraw(_ sid: String, dir: URL = Paths.replyIn) {
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("\(sid).txt"))
+    }
 }
 
 /// One of Claude's between-tool messages ("Now checking the parser."), saved by the hook.

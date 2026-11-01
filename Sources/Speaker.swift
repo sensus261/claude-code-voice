@@ -15,6 +15,10 @@ struct PlayItem {
     var voiceID: String?        // nil = main voice
     var headerLines = 0         // spoken "From <project>." lines before the reply (main voice)
     var isProgress = false      // a short between-tool-calls message, not the reply (see dropQueuedProgress)
+    /// After this reply is read to the end, the user may answer it by voice (talk back).
+    var offersReply = false
+    /// The session's reply time when this was queued: only the latest reply of a session is answered.
+    var stamp: Date?
 }
 
 /// A sentence in the playlist. `id` is its position in the whole playlist, `local` in its reply.
@@ -42,6 +46,10 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, AV
 
     /// Called when playback reaches the first sentence of a reply.
     var onItemStart: ((String) -> Void)?
+
+    /// Called when the whole playlist has been read to its end (not on stop, skip or next), with the
+    /// item that was read last.
+    var onFinish: ((PlayItem) -> Void)?
 
     /// Bumped by play() and stop(), so late async work can tell it was superseded.
     private(set) var generation = 0
@@ -113,12 +121,13 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, AV
 
     // MARK: transport
 
-    func speak(at i: Int) {
+    func speak(at i: Int, natural: Bool = false) {
         stopSynth()
         guard lines.indices.contains(i) else {
             index = lines.count
             state = .idle
             word = nil
+            if natural, let last = items.last { onFinish?(last) }
             return
         }
         let startsItem = startedItem != lines[i].item   // first time we speak this reply
@@ -303,7 +312,7 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, AV
     func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish u: AVSpeechUtterance) {
         DispatchQueue.main.async {
             guard u === self.current else { return }  // ignore stopped/stale utterances
-            self.speak(at: self.index + 1)
+            self.speak(at: self.index + 1, natural: true)
         }
     }
 
@@ -320,7 +329,7 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, AV
     func audioPlayerDidFinishPlaying(_ p: AVAudioPlayer, successfully flag: Bool) {
         DispatchQueue.main.async {
             guard p === self.player else { return }
-            self.speak(at: self.index + 1)
+            self.speak(at: self.index + 1, natural: true)
         }
     }
 

@@ -15,14 +15,15 @@ It lists every Claude Code session that has replied recently, shows each reply f
 - **Auto-read per session.** Turn it on for the sessions you want to hear as soon as they reply. Replies from several sessions queue up and never talk over each other.
 - **Progress updates.** Optionally, the short messages Claude writes between tasks ("Now checking the parser.") are read as they appear, not only the final reply, and recorded under the reply. If one has not been spoken yet when the final reply arrives, it is skipped so the reply starts right away.
 - **Control it from Claude Code.** `/voice pause`, `/voice back 3`, `/voice play` and more, typed in any session, also from your phone through Remote Control. Hook-handled commands use no model tokens. See [Control it from Claude Code](#control-it-from-claude-code).
-- **Control it by voice.** Wearing a headset connected to the Mac, say "Hey Claude, play last response" or "…play last response summarized", and also stop, pause, resume, back three, "from <project>", "which sessions", "progress on". Recognition runs on the Mac. Off until you turn it on. See [Voice commands](#voice-commands).
+- **Control it by voice.** Wearing a headset connected to the Mac, say "Hey Claude, play last response" or "…play last response summarized", and also stop, pause, resume, back three, "from <project>", "which sessions", "reply", "progress on". Recognition runs on the Mac. Off until you turn it on. See [Voice commands](#voice-commands).
 - **Spoken summaries, only on request.** Three tabs per reply:
   - **Full**: the real reply, read in full.
   - **Summary (low cost)**: Claude Haiku 5.5 condenses the reply text (you confirm first).
   - **Summary (from Claude Code)**: you run `/summarize-for-voice` in the session; the session writes the summary itself from its own memory and the app reads it.
 
   Summaries are written entirely in the language you choose (Romanian by default) and read by a voice for that language.
-- **Auto-read never calls Claude.** It only plays text the hooks already saved. Every Claude call is explicit: a click and its confirmation, or, only if you switch on "“Summarized” may create a summary" in Settings, you saying "summarized" out loud when no summary exists yet.
+- **Answer Claude by voice.** Away from the keyboard, wearing a headset on the Mac: when a session has finished and waits for you, the app reads its reply (or a summary), plays a chime and listens. Say your answer, hear it read back, say "send": it goes into the same Claude Code session, which carries on. Silence or "cancel" sends nothing. See [Talk back](#talk-back).
+- **Auto-read calls Claude only if you ask it to.** It plays text the hooks already saved. Every Claude call is explicit: a click and its confirmation; you saying "summarized" out loud when no summary exists yet, if you switch on "“Summarized” may create a summary" in Settings; or, off by default, "Summarize long replies automatically", which makes one small Haiku call per long reply of an auto-read session.
 - **Each reply in its own language.** A reply written in another language than the main voice (for example Romanian) is read by that language's voice.
 - **Better voices than macOS has for some languages.** Besides the macOS voices, the app can use [Piper](https://github.com/OHF-Voice/piper1-gpl) neural voices, which run offline on your Mac, and Microsoft's neural voices through [edge-tts](https://github.com/rany2/edge-tts), which run online. For Romanian, macOS only has Ioana; these add Mihai (Piper) and Alina and Emil (Microsoft).
 
@@ -32,6 +33,7 @@ It lists every Claude Code session that has replied recently, shows each reply f
 Claude Code session ──(Stop hook)────────────▶ state/replies/<session>.{md,txt,json}
                     ──(PostToolUse hook)──────▶ state/progress/<session>/*.txt
                     ──(/voice, /summarize…)───▶ state/commands/*.cmd, state/inbox/
+                    ──(Stop hook, asyncRewake)▶ state/waiting/<session>.json   "idle, waiting for you"
                                                      │
                                                      ▼
                                         Claude Voice app (watches the folders)
@@ -39,9 +41,13 @@ Claude Code session ──(Stop hook)────────────▶ sta
                      macOS speech synthesizer             claude CLI (low-cost
                      (AVSpeechSynthesizer), or            summary, on request only)
                      Python worker: Piper / edge-tts
+                                           │
+                     your spoken answer ───┴─(after "send")─▶ state/reply-in/<session>.txt
+                                                     │
+                     the waiting hook picks it up, exits 2 ──▶ Claude Code wakes the session with your text
 ```
 
-1. Claude Code **hooks** (`hook/talk`) feed the app. The **Stop** hook runs after every reply in every session: it saves the reply as raw markdown, a cleaned plain-text version, and metadata (project, title, transcript path). The **PostToolUse** hook (only while "Also read progress updates" is on) saves the short text blocks Claude wrote before each tool call. The **UserPromptSubmit** hook turns `/voice …` into a command for the app without calling the model. None of them plays audio or calls a model.
+1. Claude Code **hooks** (`hook/talk`) feed the app. The **Stop** hook runs after every reply in every session: it saves the reply as raw markdown, a cleaned plain-text version, and metadata (project, title, transcript path). A second Stop hook entry, `talk wait`, is the way back in: see [Talk back](#talk-back). The **PostToolUse** hook (only while "Also read progress updates" is on) saves the short text blocks Claude wrote before each tool call. The **UserPromptSubmit** hook turns `/voice …` into a command for the app without calling the model. None of them plays audio or calls a model.
 2. The **app** watches that folder, parses the markdown into display blocks and spoken sentences, and plays them with `AVSpeechSynthesizer`, one utterance per sentence. Word and sentence callbacks drive the highlight.
    - With a **Piper or Microsoft voice**, a Python worker (one per engine, kept running) turns each sentence into an audio file, several at a time, and the app plays the files. The next four sentences are made ahead, and files are cached for a week, so replays start at once. The highlighted word is estimated from the playback position. If the engine is missing or fails, that sentence is read by the best macOS voice for the language and the reader shows why.
    - The reply's language is detected with Apple's NaturalLanguage framework. If it differs from the main voice's language, the voice chosen for that language is used. The "From project" line before queued replies keeps the main voice.
@@ -97,6 +103,8 @@ Typed in any Claude Code session (also from the phone, when you drive a session 
 | `/voice prev`, `next`, `restart` | Previous reply, next reply, start of this reply |
 | `/voice auto on`, `off` | Auto-read new replies from every session |
 | `/voice progress on`, `off` | Also read progress updates |
+| `/voice reply`, `reply cancel` | Listen for your spoken answer to this session now, or stop listening |
+| `/voice talkback on`, `off` | Answer Claude by voice |
 | `/voice speed 1.2` | Speaking speed (0.6 to 1.4) |
 | `/voice status` | What the app is doing |
 | `/summarize-for-voice [language]` | The session writes a spoken summary of its last reply; the app plays it |
@@ -113,7 +121,7 @@ Settings → **Voice commands** → "Listen for spoken commands" (also in the me
 
 | Say | Does |
 |---|---|
-| "Hey Claude, play last response" | Reads the newest reply of all sessions, with "From <project>." first when there are several |
+| "Hey Claude, play last response" | Reads the newest reply of all sessions, straight away, with no "From <project>." announcement |
 | "…play last response summarized" (or "play summary") | Plays the summary: the session's own, else the cached Haiku one. If there is none, "Summarized may create a summary" decides: on, it says "Summarizing." and makes one (about 5 seconds); off, it tells you there is none. Replies under 70 words are simply read |
 | "…play last response from claude voice", "…switch to api" | The newest reply of that project (a partial name is enough) |
 | "…which sessions" | Names the sessions |
@@ -124,6 +132,27 @@ Settings → **Voice commands** → "Listen for spoken commands" (also in the me
 Saying "Hey Claude" while a reply is being read **pauses it at once**, so you can be heard and give a new command: stop, back three, play something else. If no command follows within 6 seconds, or it is not understood, the reply carries on. A chime means "Hey Claude" was heard and the command may follow (6 seconds). A low "buzz" means the words were not a command. Settings shows what the microphone is, what was heard and what it was taken for; if a command does nothing, look there first. "Start with “Hey Claude”" can be switched off if your headset's mute button is your gate: then a short bare command ("play last response", "stop") works.
 
 The Mac must stay awake with the app and the Claude Code session running. A session you started on the Mac and handed to the phone with `/remote-control` keeps running on the Mac, so its replies reach the app through the same hooks.
+
+## Talk back
+
+For when you leave the room with a headset on the Mac: start `claude`, switch the session on for your phone with `/remote-control`, walk away. The loop:
+
+1. The session finishes and waits for you. The app reads the reply (or, with "Summarize long replies automatically", a short summary), then plays a **chime**: speak now. With "Answer Claude by voice" on, this reading happens for every session that is waiting for you, even if auto-read is off for it, so you always hear what you are about to answer.
+2. **Unmute the headset and say your answer.** It ends after about two seconds of silence. You hear "Sending: <your words>. Say send, or cancel."
+3. **"Send"** (or "yes", "go ahead") puts it into the same Claude Code session, which carries on. "Cancel" (or "no", or just silence for 10 seconds) sends nothing. "Redo" or "try again" records it again.
+4. When Claude finishes again, back to 1. With "progress on", you also hear each step in between.
+
+Settings → **Talk back** → "Answer Claude by voice" (also in the menu bar; it turns on "Listen for spoken commands", because the same microphone hears you). Without a chime, say **"Hey Claude, reply"** (or "reply to <project>") to open the window yourself. Nothing is ever sent without your "send". If the window sees no sound at all, it asks whether the headset is muted.
+
+**How it gets into the session.** `talk wait` is a Stop hook registered with `asyncRewake`: after each reply it waits in the background, writing `state/waiting/<session>.json`, until the app saves your answer as `state/reply-in/<session>.txt`. It then exits with code 2, which makes Claude Code wake the idle session and show Claude the text on stderr (as an instruction to treat it as your reply). No keystrokes are injected, and it works in any terminal and with Remote Control. It arms only while the app is running with the setting on, only in interactive sessions (never in `claude -p`), and any prompt typed in the terminal or sent from the phone cancels it. A session you started before running `scripts/install-integration.sh` has no waiter: restart it.
+
+**Limits to know**
+- The Mac must stay awake (the app keeps it awake while a session is waiting), with the app and the Claude Code session running.
+- The hook is registered with a 4 hour `timeout`; a session that has waited longer than that stops listening ("This session isn't listening for replies") until it replies again.
+- Claude sees your answer as a system message from the hook, not as a typed prompt, and in the terminal it is listed as "Stop hook feedback", starting with your own words (`🎤 <what you said>`). The text tells Claude to treat it as your next message; speech-to-text can contain mistakes, so Claude is told to ask when something is unclear.
+- An answer cannot approve a permission prompt: while Claude waits for one, no reply has finished, so nobody is listening. Use the phone.
+- English only, recognized on this Mac. The headset's mute button does not close the microphone for the Mac, it only silences it: unmute to answer.
+- `scripts/install-integration.sh --uninstall-talkback` removes only the waiter hook.
 
 ## Using it
 
@@ -151,7 +180,7 @@ The Mac must stay awake with the app and the Claude Code session running. A sess
 
 When another session is playing, a "Now: project" button jumps to it. The reader follows playback into the next reply only if you were watching the one that was playing.
 
-**Settings (gear icon)**: the voice for full text, whether replies in another language use that language's voice, the summary language and its voice (with a Test button), speed, auto-read for every session, and which extra voices are installed.
+**Settings (gear icon)**: the voice for full text, whether replies in another language use that language's voice, the summary language and its voice (with a Test button), speed, auto-read for every session, automatic summaries of long replies, voice commands, talk back, and which extra voices are installed.
 
 ## More voices
 
@@ -170,7 +199,7 @@ To remove them: `uv tool uninstall piper-tts edge-tts` and delete `~/.claude/tts
 
 ## Summaries and usage
 
-Only summaries use Claude, and only on request. Auto-read, progress reading and every `/voice` command never do.
+Only summaries use Claude, and only on request: a click and its confirmation, a spoken "summarized" with its Settings switch on, or the "Summarize long replies automatically" switch (off by default), which makes one Haiku call per reply of 70 words or more, for auto-read sessions only. Auto-read without that switch, progress reading, talk back and every `/voice` command never use Claude.
 
 - **Low cost** (in the app, after you confirm) sees only the reply. It takes about 5 to 10 seconds and very little of your plan's usage.
 - **From Claude Code** (`/summarize-for-voice`) is one short turn in the session. While its prompt cache is warm (about an hour after the session's last activity on a subscription) it costs roughly as much as any short message there; if the cache expired, the conversation is processed again like for any message. The summary uses the session's own model. Models with thinking enabled may think briefly before answering.
@@ -190,6 +219,9 @@ Everything lives under `~/.claude/tts/state/`:
 | `summaries/<session>.<quick or session>.json` | cached summaries |
 | `progress/<session>/<time>-<n>.txt` | progress messages of the current or last turn |
 | `progress-enabled` | exists while "Also read progress updates" is on; the PostToolUse hook does nothing without it |
+| `talkback-enabled` | exists, and is touched every few seconds, while "Answer Claude by voice" is on and the app runs; `talk wait` arms only then |
+| `waiting/<session>.json` | the session is idle and its `talk wait` hook is armed (hook pid, Claude pid, token) |
+| `reply-in/<session>.txt` | your confirmed answer, picked up and deleted by that session's `talk wait` |
 | `commands/<time>.cmd` | commands from Claude Code, read and deleted by the app (older than 15 s are ignored) |
 | `inbox/summary-<session>.txt` | a summary written by a session, waiting for the app |
 | `pending-summary/<session>` | marks that the session's next reply is a summary |
@@ -212,8 +244,10 @@ Sources/
   Store.swift        watches the replies and progress folders; sentence splitting
   Markdown.swift     markdown → display blocks + spoken sentences
   Summarizer.swift   low-cost summary via the claude CLI, imported summaries, speech check
+  ReplyFlow.swift    talk back as pure rules: listen, capture, read back, send / cancel / redo
+  ReplyCoordinator.swift  connects those rules to the microphone, the voice and the reply-in files
   Views.swift        SwiftUI: reader, session list, settings, menu
-hook/talk            the Claude Code hooks: Stop, PostToolUse (progress), UserPromptSubmit (/voice)
+hook/talk            the Claude Code hooks: Stop, PostToolUse (progress), UserPromptSubmit (/voice), wait (talk back)
 hook/voicectl        command line control of the app
 hook/commands/       the /voice and /summarize-for-voice command files
 scripts/install-integration.sh   installs the hooks, voicectl and commands
@@ -253,14 +287,18 @@ bash tests/hook/test.sh
 # command inbox, pause/resume/prev, dropping stale progress (plays a moment of speech)
 swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Commands}.swift tests/commands/main.swift -o build/cmdtest && build/cmdtest
 
-# voice grammar and wake gate: what is heard -> what is done (no audio)
-swiftc -swift-version 5 Sources/VoiceIntent.swift tests/intent/main.swift -o build/intenttest && build/intenttest
+# voice grammar, wake gate and the "send or cancel" words: what is heard -> what is done (no audio)
+swiftc -swift-version 5 Sources/{VoiceIntent,ReplyFlow}.swift tests/intent/main.swift -o build/intenttest && build/intenttest
 
-# auto-read, progress and commands never start Claude; spoken commands start it only when allowed (stub binary + own state folder)
-swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Commands,Model,VoiceIntent}.swift tests/autoplay/main.swift -o build/autotest && build/autotest
+# talk back: the reply rules with a fake clock, the reply coordinator with a fake microphone, the waiter files (no audio)
+swiftc -swift-version 5 Sources/{VoiceIntent,ReplyFlow,ReplyCoordinator,Store}.swift tests/reply/main.swift -o build/replytest && build/replytest
+
+# auto-read, progress and commands never start Claude (auto-summarize only when switched on); spoken commands start it only when allowed;
+# the talk back wiring in the model (stub binary + own state folder, fake microphone, about 90 s, plays some speech)
+swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Commands,Model,VoiceIntent,ReplyFlow,ReplyCoordinator,VoiceListener}.swift tests/autoplay/main.swift -o build/autotest && build/autotest
 
 # off-screen screenshots of the window and Settings
-swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Views,Model,Commands,VoiceIntent,VoiceListener}.swift tests/render/main.swift -o build/render
+swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Views,Model,Commands,VoiceIntent,VoiceListener,ReplyFlow,ReplyCoordinator}.swift tests/render/main.swift -o build/render
 mkdir -p <output-folder> && build/render <output-folder>
 ```
 
@@ -269,6 +307,7 @@ mkdir -p <output-folder> && build/render <output-folder>
 - The build is signed ad hoc, so it runs on the Mac that built it. Sharing it with others needs a Developer ID signature and notarization.
 - When the session list has keyboard focus, it may take the arrow keys and space for itself. Click in the reader to use the shortcuts.
 - The app polls the replies folder every 1.5 seconds.
+- Talk back needs a session started after the hooks were installed, an app that is running, and an awake Mac; the waiter's hook `timeout` is 4 hours. Claude Code does not document the maximum for that timeout: if a long wait ends early, the session says it is no longer listening. Whether the woken session shows up on the phone through Remote Control the way it does in the terminal has not been tested here.
 - Voice commands: English only. Commands are matched against a fixed list of phrases, not understood freely. The microphone is the system's default input, so with a Bluetooth headset playback drops to phone-call quality while it is open (muting the headset with its button does not close it for the Mac), and without the headset's boom macOS may switch to the MacBook's own microphone (Settings shows which one). The recognizer runs all the time while the feature is on, which costs some CPU. Wake-word recognition is only as good as the recognizer: "Hey Claude" is also accepted as "hey cloud", "iCloud" and similar. Set `defaults write local.claude-voice voiceDebug -bool true` to log what the microphone and recognizer do to `~/.claude/tts/state/voice.log` (including the text heard).
 - The build is signed ad hoc and its signature changes on every `./build.sh`, so macOS may ask again for microphone and speech access after a rebuild.
 - `/voice` is intercepted by the hook only because `~/.claude/commands/voice.md` exists: an unknown slash command never reaches hooks. Plain `voice pause` (no slash) is intercepted without the file. Tested with `claude -p` on the Mac; driving a session from the phone through Remote Control has not been tested here.
@@ -280,7 +319,7 @@ mkdir -p <output-folder> && build/render <output-folder>
 
 ## Ideas
 
-- Voice commands in other languages; choosing a specific microphone instead of the system default.
+- Voice commands and answers in other languages (Romanian dictation has no on-device model on macOS today); choosing a specific microphone instead of the system default; approving permission prompts by voice (would need a Claude Code channel instead of a hook).
 
 ## License
 

@@ -8,6 +8,8 @@
 #   voicectl auto on|off              auto-read new replies from every session
 #   voicectl progress on|off          also read the short progress messages
 #   voicectl speed 1.2                speaking rate multiplier
+#   voicectl reply [cancel]           listen for your spoken answer to this session now (or stop listening)
+#   voicectl talkback on|off          answer Claude by voice
 #   voicectl status                   what the app is doing now
 #   add  --sid <session id>  to target a session (the hook and /voice do this for you)
 #
@@ -18,7 +20,7 @@ STATE="${CLAUDE_VOICE_STATE:-$HOME/.claude/tts/state}"
 CMDS="$STATE/commands"
 
 usage() {
-  echo "voice: pause | resume | stop | play [summary] | back N | fwd N | next | prev | restart | auto on/off | progress on/off | speed X | status"
+  echo "voice: pause | resume | stop | play [summary] | back N | fwd N | next | prev | restart | auto on/off | progress on/off | speed X | reply [cancel] | talkback on/off | status"
 }
 
 now_us() {
@@ -73,8 +75,10 @@ case "$action" in
     [ -z "$arg" ] && arg=1
     [[ "$arg" =~ ^[0-9]{1,3}$ ]] || { usage; exit 3; }
     line="$action $arg" ;;
-  auto|progress)
+  auto|progress|talkback)
     case "$arg" in on|off) line="$action $arg" ;; *) usage; exit 3 ;; esac ;;
+  reply)
+    case "$arg" in ""|cancel) line="reply${arg:+ $arg}" ;; *) usage; exit 3 ;; esac ;;
   speed)
     [[ "$arg" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { usage; exit 3; }
     line="speed $arg" ;;
@@ -82,7 +86,8 @@ case "$action" in
     if [ -f "$STATE/status.json" ]; then
       jq -r '"voice: \(.state)" + (if .reply != "" and .reply != null then " · \(.reply)" else "" end)
         + " · line \(.line)/\(.lines) · auto " + (if .autoAll then "on" else "off" end)
-        + " · progress " + (if .readProgress then "on" else "off" end) + " · speed \(.rate)"' \
+        + " · progress " + (if .readProgress then "on" else "off" end) + " · speed \(.rate)"
+        + (if .talkBack then " · talk back on" + (if (.listening | length) > 0 then " (\(.listening | length) listening)" else "" end) else "" end)' \
         "$STATE/status.json" 2>/dev/null || echo "voice: status unreadable"
     else
       echo "voice: app has not reported yet (is Claude Voice running?)"

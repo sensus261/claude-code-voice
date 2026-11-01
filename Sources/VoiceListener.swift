@@ -84,6 +84,7 @@ final class VoiceListener: ObservableObject {
         case starting
         case listening
         case armed                      // "Hey Claude" heard, waiting for the command
+        case answering                  // capturing the user's spoken answer to a session (talk back)
         case denied(String)
         case unavailable(String)
     }
@@ -107,6 +108,7 @@ final class VoiceListener: ObservableObject {
         case .starting: return "Starting…"
         case .listening: return "Listening"
         case .armed: return "Listening for the command…"
+        case .answering: return "Listening for your answer…"
         case .denied(let why), .unavailable(let why): return why
         }
     }
@@ -127,6 +129,11 @@ final class VoiceListener: ObservableObject {
     private var ticks = 0
     private var pausedForWake = false  // we paused playback when "Hey Claude" was heard
     private var silentTicks = 0         // ticks in a row with no audio from the microphone
+    // Talk back: while `capture` is set, everything heard goes to `captureHandler` and no wake phrase is needed.
+    private var capture: ReplyCaptureKind?
+    private var captureHandler: ((String) -> Void)?
+    private var captureBase = ""        // what earlier requests of this capture heard (a request lasts < 1 min)
+    private var captureSound = false    // some sound, not digital silence, reached the microphone
 
     /// Quiet seconds after which an unclaimed transcript is dropped and recognition starts fresh.
     private static let quiet: TimeInterval = 3
@@ -134,9 +141,11 @@ final class VoiceListener: ObservableObject {
     private static let refresh: TimeInterval = 50
 
     private init() {
+        // No `queue: .main`: a setting changed from a main-actor task (a spoken "progress on") would post
+        // this synchronously to the main queue it is running on and wait for itself.
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil,
-                                               queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.sync() }
+                                               queue: nil) { [weak self] _ in
+            Task { @MainActor in self?.sync() }
         }
     }
 
@@ -301,9 +310,13 @@ final class VoiceListener: ObservableObject {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.requiresOnDeviceRecognition = true
-        request.addsPunctuation = false
+        request.addsPunctuation = capture == .dictation
         request.taskHint = .dictation
-        request.contextualStrings = hints()
+        switch capture {
+        case .dictation?: request.contextualStrings = []
+        case .confirm?: request.contextualStrings = ["send", "cancel", "redo", "yes", "no", "send it", "try again"]
+        case nil: request.contextualStrings = hints()
+        }
         sink.set(request)
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
             let text = result?.bestTranscription.formattedString
@@ -326,7 +339,11 @@ final class VoiceListener: ObservableObject {
             lastHeard = text
             if !text.isEmpty, !problem.isEmpty { problem = "" }
             VoiceLog.write("heard: \"\(text)\"")
-            if !isEcho(text) { handle(gate.hear(text, now: Date())) }
+            if capture != nil {
+                captureHandler?((captureBase + " " + text).trimmingCharacters(in: .whitespaces))
+            } else if !isEcho(text) {
+                handle(gate.hear(text, now: Date()))
+            }
         }
         if let failure {
             VoiceLog.write("recognizer error: \(failure)")
@@ -338,6 +355,10 @@ final class VoiceListener: ObservableObject {
             }
         }
         guard finished, gen == generation else { return }
+        if capture != nil, !transcript.isEmpty {       // keep what was said; the next request adds to it
+            captureBase = (captureBase + " " + transcript).trimmingCharacters(in: .whitespaces)
+            transcript = ""
+        }
         // The recognizer ended this request (its limit, or an error such as "no speech detected").
         // Start another, but not in a tight loop if it keeps failing.
         generation += 1
@@ -375,6 +396,17 @@ final class VoiceListener: ObservableObject {
             silentTicks = 0
         }
         if ticks % 10 == 0 { VoiceLog.write("level \(String(format: "%.3f", audio.level)) buffers \(audio.buffers)") }
+        if capture != nil {
+            // The answer flow (ReplyFlow) owns the timing. A request only lasts a minute or so: carry what
+            // it heard over to the next one.
+            if audio.level > 0.0003 { captureSound = true }
+            status = .answering
+            if Date().timeIntervalSince(startedAt) > 45 {
+                captureBase = (captureBase + " " + transcript).trimmingCharacters(in: .whitespaces)
+                newRecognition()
+            }
+            return
+        }
         handle(gate.tick(now: Date()))
         guard running else { return }
         status = gate.isArmed ? .armed : .listening
@@ -441,9 +473,42 @@ final class VoiceListener: ObservableObject {
         case .forward(let n): return "forward \(n)"
         case .progress(let on): return "progress \(on ? "on" : "off")"
         case .listSessions: return "list sessions"
+        case .reply(let project): return "reply" + (project.map { " to \($0)" } ?? "")
         default: return String(describing: i)
         }
     }
+
+    // MARK: talk back (ReplyMic)
+
+    /// True when the microphone is open and recognizing, so an answer can be heard.
+    var isReady: Bool { running && recognizer != nil }
+
+    /// Hear a free answer (`.dictation`) or "send / cancel / redo" (`.confirm`) instead of commands.
+    /// `onText` gets everything heard in this capture so far, again each time it grows.
+    func beginCapture(_ kind: ReplyCaptureKind, onText: @escaping (String) -> Void) {
+        capture = kind
+        captureHandler = onText
+        captureBase = ""
+        captureSound = false
+        pausedForWake = false
+        VoiceLog.write("capture: begin \(kind)")
+        if running { newRecognition() }
+    }
+
+    /// Back to spoken commands.
+    func endCapture() {
+        guard capture != nil else { return }
+        VoiceLog.write("capture: end")
+        capture = nil
+        captureHandler = nil
+        captureBase = ""
+        if running { newRecognition() }
+        status = running ? .listening : status
+    }
+
+    /// Whether any sound (not digital silence) came from the microphone during this capture: a muted
+    /// headset delivers none.
+    var heardSound: Bool { captureSound }
 
     // MARK: input device
 
@@ -469,3 +534,5 @@ final class VoiceListener: ObservableObject {
         return name.takeRetainedValue() as String
     }
 }
+
+extension VoiceListener: ReplyMic {}

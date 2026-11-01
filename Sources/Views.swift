@@ -642,6 +642,10 @@ struct SettingsView: View {
     @AppStorage("voiceControl") private var voiceControl = false
     @AppStorage("voiceWakeWord") private var voiceWakeWord = true
     @AppStorage("voiceSummary") private var voiceSummary = false
+    @AppStorage("talkBack") private var talkBack = false
+    @AppStorage("talkbackAuto") private var talkbackAuto = true
+    @AppStorage("replyWindow") private var replyWindow = 30.0
+    @AppStorage("autoSummarize") private var autoSummarize = false
     @ObservedObject private var catalog = VoiceCatalog.shared
     @ObservedObject private var voice = VoiceListener.shared
 
@@ -667,6 +671,10 @@ struct SettingsView: View {
                 Toggle("Also read progress updates", isOn: $readProgress)
                     .onChange(of: readProgress) { _, _ in AppModel.shared.syncProgressFlag() }
                 Text("The short messages Claude writes between tasks are read as they appear, for the sessions that are auto-read, and recorded under each reply. Needs the PostToolUse hook (scripts/install-integration.sh). Updates not yet spoken when the final reply arrives are skipped.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Toggle("Summarize long replies automatically (uses Claude Haiku)", isOn: $autoSummarize)
+                Text("Off by default. For the sessions that are auto-read, a reply of \(AppModel.summaryMinWords) words or more is read as a short summary, in your summary language, instead of in full: one small Haiku call per reply on your Claude subscription (about 5 to 10 seconds). If it fails or takes too long the full reply is read.")
                     .font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Button("Test Voice") { AppModel.shared.speaker.test() }
@@ -695,11 +703,30 @@ struct SettingsView: View {
                     }
                 }
                 Text(voiceWakeWord
-                     ? "Say “Hey Claude, play last response”, “…play last response summarized”, “…stop”, “…pause”, “…resume”, “…back three”, “…play last response from <project>”, “…which sessions”, “…progress on” or “…what's the status”."
-                     : "Say “play last response”, “play last response summarized”, “stop”, “pause”, “resume”, “back three”, “play last response from <project>”, “which sessions”, “progress on” or “what's the status”.")
+                     ? "Say “Hey Claude, play last response”, “…play last response summarized”, “…stop”, “…pause”, “…resume”, “…back three”, “…play last response from <project>”, “…which sessions”, “…reply”, “…progress on” or “…what's the status”."
+                     : "Say “play last response”, “play last response summarized”, “stop”, “pause”, “resume”, “back three”, “play last response from <project>”, “which sessions”, “reply”, “progress on” or “what's the status”.")
                     .font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("Speech is recognized on this Mac and never recorded. The microphone is whatever macOS uses as input: with a Bluetooth headset, playback sounds like a phone call while it is open. “Summarized” plays an existing summary; only when there is none does it ask Claude Haiku for one (about 5 seconds, a little of your Claude usage), and only if the last switch is on. Auto-read never does.")
+                Text("Speech is recognized on this Mac and never recorded. The microphone is whatever macOS uses as input: with a Bluetooth headset, playback sounds like a phone call while it is open. “Summarized” plays an existing summary; only when there is none does it ask Claude Haiku for one (about 5 seconds, a little of your Claude usage), and only if the last switch is on. Auto-read only does with “Summarize long replies automatically”.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Section("Talk back") {
+                Toggle("Answer Claude by voice", isOn: $talkBack)
+                    .onChange(of: talkBack) { _, on in
+                        if on, !voiceControl { voiceControl = true }       // the answer is heard by the same microphone
+                        AppModel.shared.syncTalkbackFlag()
+                    }
+                Toggle("Listen for my answer after a reply is read", isOn: $talkbackAuto)
+                    .disabled(!talkBack)
+                Picker("Wait for me to start talking", selection: $replyWindow) {
+                    Text("15 seconds").tag(15.0)
+                    Text("30 seconds").tag(30.0)
+                    Text("45 seconds").tag(45.0)
+                    Text("60 seconds").tag(60.0)
+                }
+                .disabled(!talkBack)
+                Text("When a session has finished and waits for you, its reply (or summary) is read, a chime sounds, and you can speak your answer: unmute the headset. Your words are read back and go to that same Claude Code session only after you say “send”; silence or “cancel” sends nothing. Or say “Hey Claude, reply” at any time. Needs the hooks from scripts/install-integration.sh in a session started after installing, voice commands on, and the Mac awake. Recognition is English and happens on this Mac.")
                     .font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -716,7 +743,7 @@ struct SettingsView: View {
                     ForEach(Languages.all, id: \.code) { l in Text(l.native).tag(l.code) }
                 }
                 LanguageVoicePicker(lang: summaryLang).id(summaryLang)
-                Text("Low cost: Claude Haiku 5.5 reads only the reply, made only when you ask and confirm. From Claude Code: run /summarize-for-voice in the session; it writes the summary itself (about one short message of usage) and this app reads it. Auto-read never calls Claude.")
+                Text("Low cost: Claude Haiku 5.5 reads only the reply, made only when you ask and confirm. From Claude Code: run /summarize-for-voice in the session; it writes the summary itself (about one short message of usage) and this app reads it. Auto-read calls Claude only if you turn on “Summarize long replies automatically”.")
                     .font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -749,7 +776,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 420, height: 680)
+        .frame(width: 420, height: 780)
         .onAppear {
             if voiceID.isEmpty { voiceID = Voices.mainID }
         }
@@ -802,6 +829,7 @@ struct MenuContent: View {
     @Environment(\.openWindow) private var openWindow
     @AppStorage("pinned") private var pinned = true
     @AppStorage("voiceControl") private var voiceControl = false
+    @AppStorage("talkBack") private var talkBack = false
 
     var body: some View {
         let newCount = store.visible.filter(\.isNew).count
@@ -818,6 +846,11 @@ struct MenuContent: View {
             .disabled(newCount == 0)
         Divider()
         Toggle("Voice Commands", isOn: $voiceControl)
+        Toggle("Answer Claude by Voice", isOn: $talkBack)
+            .onChange(of: talkBack) { _, on in
+                if on, !voiceControl { voiceControl = true }
+                AppModel.shared.syncTalkbackFlag()
+            }
         if voiceControl {
             Text(voice.statusText).font(.caption)
         }

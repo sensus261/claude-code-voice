@@ -13,6 +13,8 @@ enum VoiceIntent: Equatable {
     /// Read the latest saved progress updates once.
     case status
     case listSessions
+    /// Answer a session by voice ("reply", "reply to api"): opens the listening window now.
+    case reply(project: String?)
 }
 
 /// Turns what the speech recognizer heard into a `VoiceIntent`. English only; the phrase lists
@@ -93,6 +95,9 @@ enum VoiceGrammar {
             return .restart
         }
 
+        // Answer Claude by voice. Before "the reply itself": "reply" is also a noun there ("play last reply").
+        if let r = replyIntent(w) { return r }
+
         // The reply itself.
         let verb = has("play", "read", "hear", "tell", "give", "say")
         let summaryWord = has("summary", "summarized", "summarised", "summarize", "summarise", "summarizing")
@@ -124,6 +129,31 @@ enum VoiceGrammar {
         if has("previous", "prev") { return .previous }
         if has("back", "rewind") { return .back(count(in: w, after: ["back", "rewind"])) }
         return nil
+    }
+
+    private static let replyVerbs: Set<String> = ["reply", "respond", "answer", "replying", "responding"]
+    /// Words that make "reply" a noun to play ("play last reply", "read the reply from api").
+    private static let replyBlockers: Set<String> = [
+        "play", "read", "hear", "tell", "give", "last", "latest", "recent", "newest", "summary", "summarized",
+        "summarised", "summarize", "summarise", "short", "shorter", "brief", "from", "switch", "status", "progress",
+        "what", "whats", "which", "how", "is", "was",
+    ]
+
+    /// "reply", "reply to api", "I want to reply", "answer back", "talk back". Short utterances only.
+    private static func replyIntent(_ w: [String]) -> VoiceIntent? {
+        guard w.count <= 5, !w.contains(where: replyBlockers.contains) else { return nil }
+        let line = " " + w.joined(separator: " ") + " "
+        guard w.contains(where: replyVerbs.contains) || line.contains(" talk back ") else { return nil }
+        // "the reply" / "a response" is the thing itself, not a request to answer it.
+        if w.indices.contains(where: { $0 > 0 && replyVerbs.contains(w[$0]) && ["the", "a", "an", "that", "this"].contains(w[$0 - 1]) }) {
+            return nil
+        }
+        var name: String?
+        if let to = w.firstIndex(of: "to"), to + 1 < w.count {
+            let tail = w[(to + 1)...].filter { !projectFillers.contains($0) && !replyVerbs.contains($0) && $0 != "back" }
+            if !tail.isEmpty { name = tail.joined(separator: " ") }
+        }
+        return .reply(project: name)
     }
 
     /// "back 3" -> 3. A recognizer writing "back to" for "back two" counts as 2. Default 1.

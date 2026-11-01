@@ -1,14 +1,29 @@
-// Autoplay test: no Claude call is ever made by auto-read, progress reading or "play summary".
-// Hermetic: its own state folder and a stub `claude` that records whether it was started.
-//   swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Commands,Model,VoiceIntent}.swift tests/autoplay/main.swift -o build/autotest
+// Autoplay test: no Claude call is ever made by auto-read, progress reading or "play summary" (auto-read
+// calls Claude only for long replies, and only when "autoSummarize" is on), and the talk-back wiring:
+// a finished reply opens the answer window, an answer is read back and delivered after "send".
+// Hermetic: its own state folder and a stub `claude` that records whether (and how often) it was started.
+//   swiftc -swift-version 5 Sources/{Speaker,Voices,ExternalTTS,Store,Markdown,Summarizer,Commands,Model,VoiceIntent,ReplyFlow,ReplyCoordinator,VoiceListener}.swift tests/autoplay/main.swift -o build/autotest
 //   build/autotest        (plays about a second of speech)
 import Foundation
+
+setvbuf(stdout, nil, _IOLBF, 0)      // line by line, also when piped
 
 let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("cv-auto-\(UUID().uuidString)")
 let marker = tmp.appendingPathComponent("claude-was-started")
 let stub = tmp.appendingPathComponent("claude-stub")
+let counter = tmp.appendingPathComponent("claude-runs")       // one line per start
+let okMode = tmp.appendingPathComponent("stub-ok")            // exists: the stub prints a summary and succeeds
+let slowMode = tmp.appendingPathComponent("stub-slow")        // exists: ... after 3 seconds
 try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
-try "#!/bin/sh\ntouch '\(marker.path)'\nexit 1\n".write(to: stub, atomically: true, encoding: .utf8)
+try """
+    #!/bin/sh
+    touch '\(marker.path)'
+    echo run >> '\(counter.path)'
+    [ -f '\(slowMode.path)' ] && sleep 3
+    if [ -f '\(okMode.path)' ]; then echo "I fixed the migration and every table was copied."; exit 0; fi
+    exit 1
+
+    """.write(to: stub, atomically: true, encoding: .utf8)
 try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
 
 // Must be set before Paths / ClaudeCLI are first used.
@@ -25,11 +40,38 @@ func check(_ name: String, _ ok: Bool) {
 func wait(_ s: Double) { RunLoop.main.run(until: Date().addingTimeInterval(s)) }
 // Spinning the run loop does not let main-actor Tasks run (we are inside one); awaiting does.
 func nap(_ s: Double) async { try? await Task.sleep(nanoseconds: UInt64(s * 1_000_000_000)) }
+// Waits while main-actor tasks and dispatch blocks (speech finished, summaries) run. Run-loop timers do not
+// fire in this harness once a task has awaited, so the two polls the app drives with timers are driven by
+// hand: the store's folder scan and the answer flow's tick.
+func pump(_ s: Double) async {
+    let end = Date().addingTimeInterval(s)
+    var n = 0
+    while Date() < end {
+        await nap(0.05)
+        n += 1
+        if n % 3 == 0 {
+            await MainActor.run {
+                AppModel.shared.store.scan()
+                AppModel.shared.replies.tick()
+            }
+        }
+    }
+}
 func write(_ url: URL, _ text: String) {
     try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     try? text.write(to: url, atomically: true, encoding: .utf8)
 }
 var claudeStarted: Bool { FileManager.default.fileExists(atPath: marker.path) }
+var claudeRuns: Int { ((try? String(contentsOf: counter, encoding: .utf8)) ?? "").split(separator: "\n").count }
+
+@MainActor final class FakeMic: ReplyMic {
+    var isReady = true
+    var heardSound = true
+    var kinds: [ReplyCaptureKind] = []
+    var onText: ((String) -> Void)?
+    func beginCapture(_ kind: ReplyCaptureKind, onText: @escaping (String) -> Void) { kinds.append(kind); self.onText = onText }
+    func endCapture() { onText = nil }
+}
 
 Task { @MainActor in
     let model = AppModel.shared
@@ -94,7 +136,7 @@ Task { @MainActor in
 
     model.runVoice(.play(summary: false, project: nil))
     check("voice: last response is the newest session's", model.speaker.items.first?.sid == sid2)
-    check("voice: says whose reply it is with several sessions", model.speaker.items.first?.headerLines == 1)
+    check("voice: no spoken \"From <project>\" header, even with several sessions", model.speaker.items.first?.headerLines == 0)
     model.runVoice(.play(summary: false, project: "demo"))
     check("voice: 'from demo' plays the older session", model.speaker.items.first?.sid == sid)
     model.runVoice(.play(summary: false, project: "api"))
@@ -163,6 +205,162 @@ Task { @MainActor in
     await nap(2)
     check("voice: 'summarized' with the toggle on starts Claude", claudeStarted)
     check("voice: a failed summary is reported", model.speaker.items.first?.lines.first == "I could not make a summary.")
+
+
+    // MARK: auto-summarize (the one automatic Claude call, off by default)
+
+    UserDefaults.standard.set("en-US", forKey: "summaryLang")
+    UserDefaults.standard.set(true, forKey: "autoAll")
+    UserDefaults.standard.set(false, forKey: "readProgress")
+    UserDefaults.standard.set(false, forKey: "voiceSummary")
+    AppModel.autoSummaryPatience = 1.5
+    let longText = Array(repeating: "The migration finished and every table was copied without a single error.", count: 10).joined(separator: " ")
+    let shortText = "The build is green and all tests pass."
+    func reply(_ sid: String, _ project: String, _ text: String) {
+        write(Paths.replies.appendingPathComponent("\(sid).json"), #"{"sid":"\#(sid)","project":"\#(project)","title":"T"}"#)
+        write(Paths.replies.appendingPathComponent("\(sid).md"), text)
+        write(Paths.replies.appendingPathComponent("\(sid).txt"), text)
+    }
+    @MainActor func resetRuns() {
+        try? FileManager.default.removeItem(at: marker)
+        try? FileManager.default.removeItem(at: counter)
+        model.speaker.play([])
+    }
+    @MainActor func lastItem(_ sid: String) -> PlayItem? { model.speaker.items.last { $0.sid == sid } }
+
+    resetRuns()
+    await pump(1.2)
+    reply("_sumA", "alpha", longText)
+    await pump(2.2)
+    check("autoSummarize off: a long reply is read in full", lastItem("_sumA")?.mode == .full)
+    check("autoSummarize off: Claude not started", !claudeStarted)
+
+    UserDefaults.standard.set(true, forKey: "autoSummarize")
+    resetRuns()
+    await pump(1.2)
+    reply("_sumB", "beta", shortText)
+    await pump(2.2)
+    check("autoSummarize on: a short reply is read in full", lastItem("_sumB")?.mode == .full)
+    check("autoSummarize on: ...without starting Claude", !claudeStarted)
+
+    FileManager.default.createFile(atPath: okMode.path, contents: Data())
+    resetRuns()
+    await pump(1.2)
+    reply("_sumC", "gamma", longText)
+    await pump(2.2)
+    await pump(1)
+    check("autoSummarize on: a long reply starts Claude exactly once", claudeRuns == 1)
+    check("autoSummarize on: ...and reads the summary", lastItem("_sumC")?.mode == .quick
+          && lastItem("_sumC")?.lines.joined(separator: " ").contains("migration") == true)
+    check("autoSummarize on: ...which can be answered by voice", lastItem("_sumC")?.offersReply == true)
+
+    try? FileManager.default.removeItem(at: okMode)
+    resetRuns()
+    await pump(1.2)
+    reply("_sumD", "delta", longText)
+    await pump(2.2)
+    await pump(1)
+    check("autoSummarize on: a failing Claude falls back to the full reply", lastItem("_sumD")?.mode == .full && claudeRuns >= 1)
+
+    FileManager.default.createFile(atPath: okMode.path, contents: Data())
+    FileManager.default.createFile(atPath: slowMode.path, contents: Data())
+    resetRuns()
+    await pump(1.2)
+    reply("_sumE", "epsilon", longText)
+    await pump(2.2)
+    await pump(1)
+    check("autoSummarize on: too slow, the full reply is read instead", lastItem("_sumE")?.mode == .full)
+    await pump(3.5)
+    check("autoSummarize on: ...and the late summary is not read afterwards",
+          model.speaker.items.filter { $0.sid == "_sumE" }.count == 1)
+    try? FileManager.default.removeItem(at: slowMode)
+    try? FileManager.default.removeItem(at: okMode)
+
+    // MARK: talk back (fake microphone; real timers and speech)
+
+    UserDefaults.standard.set(false, forKey: "autoSummarize")
+    let mic = FakeMic()
+    model.useReplyMic(mic)
+    UserDefaults.standard.set(true, forKey: "talkBack")
+    model.syncTalkbackFlag()
+    check("talk back on: the hook's flag file exists", FileManager.default.fileExists(atPath: Paths.talkbackFlag.path))
+
+    func arm(_ sid: String) {
+        let json = #"{"sid":"\#(sid)","token":"1.2","pid":\#(getpid()),"claude":\#(getpid()),"started":1}"#
+        write(Paths.waiting.appendingPathComponent("\(sid).json"), json)
+    }
+    func disarm(_ sid: String) { try? FileManager.default.removeItem(at: Paths.waiting.appendingPathComponent("\(sid).json")) }
+    let inFile = Paths.replyIn.appendingPathComponent("talk1.txt")
+
+    // not armed -> no window
+    resetRuns()
+    await pump(1.2)
+    reply("talk1", "web app", shortText)
+    await pump(8)
+    check("reply read, session not waiting: no window", mic.kinds.isEmpty)
+
+    // armed -> window after the reply is read to the end
+    arm("talk1")
+    await pump(1.2)
+    reply("talk1", "web app", "The build is green. Should I deploy it?")
+    var tries = 0
+    while mic.kinds.isEmpty, tries < 40 { await pump(0.5); tries += 1 }
+    check("reply read to the end, session waiting: the answer window opens", mic.kinds == [.dictation])
+    check("...for that session", model.replies.activeSid == "talk1")
+
+    // a reply of another session during the window waits its turn
+    await pump(1.2)
+    reply("other1", "other thing", "Another session finished meanwhile.")
+    await pump(2.2)
+    check("another session's reply is held while an answer is taken", !model.speaker.items.contains { $0.sid == "other1" })
+
+    mic.onText?("yes ship it")
+    tries = 0
+    while model.speaker.items.first?.sid != "_reply", tries < 40 { await pump(0.25); tries += 1 }
+    check("the answer is read back", model.speaker.items.first?.lines.first == "Sending: yes ship it. Say send, or cancel.")
+    tries = 0
+    while mic.kinds.count < 2, tries < 40 { await pump(0.5); tries += 1 }
+    check("after the read-back it listens for send", mic.kinds == [.dictation, .confirm])
+    check("nothing delivered yet", !FileManager.default.fileExists(atPath: inFile.path))
+    mic.onText?("send")
+    check("send: the answer is handed to the session", (try? String(contentsOf: inFile, encoding: .utf8)) == "yes ship it")
+    try? FileManager.default.removeItem(at: inFile)        // what `talk wait` does when it takes it
+    tries = 0
+    while !model.speaker.items.contains(where: { $0.sid == "other1" }), tries < 40 { await pump(0.5); tries += 1 }
+    check("then the held reply is read", model.speaker.items.contains { $0.sid == "other1" })
+    check("and Claude was never started by any of this", !claudeStarted)
+
+    // "Hey Claude, reply"
+    model.speaker.play([])
+    mic.kinds = []
+    model.runVoice(.reply(project: nil))
+    check("voice 'reply' opens the window for the waiting session", mic.kinds == [.dictation] && model.replies.activeSid == "talk1")
+    model.runVoice(.stop)
+    check("any other command ends it", !model.replies.isBusy)
+    disarm("talk1")
+    mic.kinds = []
+    model.runVoice(.reply(project: nil))
+    check("voice 'reply' with nobody waiting says so", mic.kinds.isEmpty
+          && model.speaker.items.first?.lines.first?.contains("isn't listening") == true)
+    UserDefaults.standard.set(false, forKey: "talkBack")
+    model.syncTalkbackFlag()
+    check("talk back off: the flag file is removed", !FileManager.default.fileExists(atPath: Paths.talkbackFlag.path))
+    model.runVoice(.reply(project: nil))
+    check("voice 'reply' with talk back off says so", model.speaker.items.first?.lines.first?.contains("off") == true)
+
+    // "progress on" also makes sure the session is read aloud
+    UserDefaults.standard.set(false, forKey: "autoAll")
+    UserDefaults.standard.removeObject(forKey: "autoSids")
+    model.runVoice(.progress(on: true))
+    check("progress on by voice: the session being followed is auto-read",
+          (UserDefaults.standard.string(forKey: "autoSids") ?? "").isEmpty == false
+          && model.speaker.items.first?.lines.first?.contains("out loud") == true)
+    model.runVoice(.stop)
+
+    UserDefaults.standard.removeObject(forKey: "summaryLang")
+    UserDefaults.standard.removeObject(forKey: "talkBack")
+    UserDefaults.standard.removeObject(forKey: "autoSids")
+    UserDefaults.standard.removeObject(forKey: "autoSummarize")
 
     UserDefaults.standard.removeObject(forKey: "voiceSummary")
     UserDefaults.standard.removeObject(forKey: "autoAll")

@@ -1,5 +1,5 @@
 // Voice grammar and wake gate: what the recognizer hears -> what the app does. No audio, no Claude.
-//   swiftc -swift-version 5 Sources/VoiceIntent.swift tests/intent/main.swift -o build/intenttest
+//   swiftc -swift-version 5 Sources/{VoiceIntent,ReplyFlow}.swift tests/intent/main.swift -o build/intenttest
 //   build/intenttest
 import Foundation
 
@@ -46,6 +46,16 @@ let table: [(String, VoiceIntent?)] = [
     ("turn progress updates off", .progress(on: false)),
     ("what's the status", .status), ("what is the progress", .status), ("read progress", .status),
     ("how is it going", .status),
+    // answering a session by voice; "reply" as a noun still plays
+    ("reply", .reply(project: nil)), ("Reply.", .reply(project: nil)), ("respond", .reply(project: nil)),
+    ("I want to reply", .reply(project: nil)), ("let me answer", .reply(project: nil)),
+    ("answer back", .reply(project: nil)), ("talk back", .reply(project: nil)),
+    ("reply to api", .reply(project: "api")), ("reply to claude voice", .reply(project: "claude voice")),
+    ("reply to the api server", .reply(project: "api server")),
+    ("play the last reply", .play(summary: false, project: nil)),
+    ("read the reply from api", .play(summary: false, project: "api")),
+    ("what is the reply", nil),
+    ("I will reply to that email when I get back to my desk this afternoon", nil),
     // not commands
     ("", nil), ("hello there", nil), ("the weather is nice today", nil),
     ("I think we should stop by the shop later and talk about it", nil),   // "stop" in a long sentence
@@ -56,6 +66,28 @@ for (text, expected) in table {
     check("parse \"\(text)\" -> \(String(describing: expected))" + (got == expected ? "" : "  (got \(String(describing: got)))"),
           got == expected)
 }
+
+// MARK: answer flow vocabulary ("send or cancel?")
+
+let confirmTable: [(String, ReplyConfirm?)] = [
+    ("send", .send), ("Send.", .send), ("send it", .send), ("yes", .send), ("yes please", .send),
+    ("go ahead", .send), ("okay", .send), ("confirm", .send),
+    ("cancel", .cancel), ("no", .cancel), ("nope", .cancel), ("never mind", .cancel), ("forget it", .cancel),
+    ("no don't send it", .cancel), ("do not send", .cancel), ("stop", .cancel),
+    ("redo", .redo), ("again", .redo), ("try again", .redo), ("start over", .redo),
+    ("hmm", nil), ("", nil), ("what", nil),
+    ("I think you should send the message to the whole team right now", nil),   // a sentence, not an answer
+]
+for (text, expected) in confirmTable {
+    let got = ReplyGrammar.confirm(text)
+    check("confirm \"\(text)\" -> \(String(describing: expected))" + (got == expected ? "" : "  (got \(String(describing: got)))"),
+          got == expected)
+}
+check("abort: 'cancel that'", ReplyGrammar.isAbort("cancel that"))
+check("abort: 'never mind.'", ReplyGrammar.isAbort("Never mind."))
+check("abort: a one-word 'no' can be the answer", !ReplyGrammar.isAbort("no"))
+check("abort: nor 'cancel' or 'stop'", !ReplyGrammar.isAbort("cancel") && !ReplyGrammar.isAbort("stop"))
+check("abort: not inside an answer", !ReplyGrammar.isAbort("never mind the build is green"))
 
 // MARK: wake phrase
 

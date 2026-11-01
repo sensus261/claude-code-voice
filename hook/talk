@@ -11,6 +11,11 @@
 #                    ~/.claude/tts/state/progress/<session>/<time>-<n>.txt
 #   talk prompt    UserPromptSubmit hook. Turns "/voice pause", "/voice back 3" ... into app commands
 #                  without calling the model at all.
+#   talk wait      Stop hook, registered with asyncRewake. With "Answer by voice" on in the app, it waits
+#                  in the background for the answer the app saves in
+#                    ~/.claude/tts/state/reply-in/<session>.txt
+#                  and hands it to Claude by exiting 2 (Claude Code wakes the idle session and shows it
+#                  the text on stderr). Does nothing otherwise.
 # Playback lives in the app. See README.
 
 STATE="${CLAUDE_VOICE_STATE:-$HOME/.claude/tts/state}"
@@ -21,7 +26,7 @@ VOICECTL="$HERE/voicectl"
 mkdir -p "$REPLIES" "$STATE/heard"
 
 mode="${1:-}"
-case "$mode" in hook|progress|prompt) ;; *) echo "Playback moved to the Claude Voice app (~/Applications)."; exit 0 ;; esac
+case "$mode" in hook|progress|prompt|wait) ;; *) echo "Playback moved to the Claude Voice app (~/Applications)."; exit 0 ;; esac
 [ -n "${CLAUDE_VOICE_SUMMARY:-}" ] && exit 0   # the app's own summary calls
 
 # Markdown -> speakable text: drop code blocks, URLs, table pipes, symbols.
@@ -62,6 +67,72 @@ write_meta() {   # write_meta <sid> <cwd> <transcript>
 
 now_ms() { perl -MTime::HiRes=time -e 'printf "%.0f", time*1000' 2>/dev/null || echo "$(date +%s)000"; }
 
+# ───────────────────────────── wait: Stop, asyncRewake ─────────────────────────────
+# Armed after every reply of an interactive session while the app's "Answer by voice" is on. Ends by
+#   exit 2  an answer arrived (stderr is what Claude gets; Claude Code wakes the idle session with it)
+#   exit 0  cancelled (someone typed a prompt, or a newer reply took over), the session or the wait ended
+# Why not just a timeout: Claude Code does not kill a pending hook when a new prompt starts, so the
+# waiter checks that its own token is still in waiting/<sid>.json (`talk prompt` deletes it; a newer
+# waiter overwrites it).
+if [ "$mode" = wait ]; then
+  # `claude -p` runs this hook synchronously and treats exit 2 as "keep going": it would loop. Only wait
+  # in a session that has someone at the keyboard.
+  [ "${CLAUDE_CODE_SESSION_ATTENDED:-}" = 1 ] || exit 0
+  flag="$STATE/talkback-enabled"          # the app touches it every few seconds while the setting is on
+  [ -f "$flag" ] || exit 0
+  [ $(( $(date +%s) - $(stat -f %m "$flag" 2>/dev/null || echo 0) )) -le 20 ] || exit 0
+  input=$(cat)
+  sid=$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null)   # stop_hook_active is irrelevant here
+  [[ "$sid" =~ ^[A-Za-z0-9_-]+$ ]] || exit 0
+
+  WAITING="$STATE/waiting"; REPLYIN="$STATE/reply-in"
+  mkdir -p "$WAITING" "$REPLYIN"; chmod 700 "$WAITING" "$REPLYIN" 2>/dev/null
+  wf="$WAITING/$sid.json"; rin="$REPLYIN/$sid.txt"
+  watch="${CLAUDE_VOICE_WAIT_PARENT:-${CLAUDE_PID:-$PPID}}"      # the claude process we belong to
+  poll="${CLAUDE_VOICE_WAIT_POLL:-0.5}"
+  max="${CLAUDE_VOICE_WAIT_MAX:-14340}"                          # stay under the hook's own `timeout` (14400)
+  tok="$$.$(now_ms)"
+
+  mine() { [ -f "$wf" ] && [[ "$(<"$wf")" == *"\"token\":\"$tok\""* ]]; }
+  trap 'mine && rm -f "$wf"' EXIT
+  trap 'exit 0' TERM INT HUP
+
+  rm -f "$rin"       # an answer left over from a waiter that is gone belongs to nobody
+  jq -nc --arg sid "$sid" --arg tok "$tok" --argjson pid "$$" --argjson claude "$watch" --argjson at "$(date +%s)" \
+    '{sid: $sid, token: $tok, pid: $pid, claude: $claude, started: $at}' > "$WAITING/.$sid.$tok.tmp" \
+    && mv "$WAITING/.$sid.$tok.tmp" "$wf" || exit 0
+
+  start=$SECONDS
+  while :; do
+    mine || exit 0                                              # cancelled or superseded
+    kill -0 "$watch" 2>/dev/null || exit 0                      # the session is gone
+    if [ -f "$rin" ]; then
+      claim="$REPLYIN/.$sid.$tok"
+      if mv "$rin" "$claim" 2>/dev/null; then
+        # Literal text only: no control or ANSI characters, at most 4000 characters, never evaluated.
+        text=$(perl -Mutf8 -CSD -0777 -pe '
+          s/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]//g;
+          s/\s+\z//; s/\A\s+//; $_ = substr($_, 0, 4000);' "$claim")
+        rm -f "$claim"
+        [ -n "${text//[[:space:]]/}" ] || continue
+        rm -f "$wf"
+        # The user's words come first: Claude Code shows the start of this text in the terminal.
+        {
+          printf '🎤 %s\n\n' "$text"
+          printf '%s\n' "The line above is the user's own words. This is not an error and not hook feedback: the user is"
+          printf '%s\n' "away from the keyboard and has just answered your last message by voice. It was transcribed from"
+          printf '%s\n' "speech, so it can contain recognition mistakes; if something is unclear or risky, ask a short"
+          printf '%s\n' "question instead of guessing. Treat it as their next message and respond to it normally."
+          printf '[voice reply %s]\n' "$tok"
+        } >&2
+        exit 2
+      fi
+    fi
+    [ $(( SECONDS - start )) -lt "$max" ] || exit 0
+    sleep "$poll"
+  done
+fi
+
 # ───────────────────────────── prompt: /voice … ─────────────────────────────
 if [ "$mode" = prompt ]; then
   input=$(cat)
@@ -82,6 +153,9 @@ if [ "$mode" = prompt ]; then
   if [ -n "$sid" ]; then
     case "$prompt" in /summarize-for-voice*) ;; *) rm -f "$STATE/pending-summary/$sid" ;; esac
     [ -f "$STATE/progress-enabled" ] && rm -f "$PROG/$sid.mark"
+    # Someone typed (or sent from the phone): that input wins, and a voice answer is no longer wanted.
+    # The `/voice …` prompts left above, so they never get here. The next Stop arms a new waiter.
+    rm -f "$STATE/waiting/$sid.json" "$STATE/reply-in/$sid.txt"
   fi
   exit 0
 fi
@@ -202,5 +276,6 @@ printf '%s\n' "$msg" > "$REPLIES/.$sid.md.tmp" && mv "$REPLIES/.$sid.md.tmp" "$R
 printf '%s\n' "$msg" | clean > "$REPLIES/.$sid.txt.tmp" && mv "$REPLIES/.$sid.txt.tmp" "$REPLIES/$sid.txt"
 
 find "$REPLIES" "$STATE/heard" "$STATE/summaries" "$STATE/progress" "$STATE/inbox" "$STATE/commands" \
+  "$STATE/waiting" "$STATE/reply-in" \
   -type f -mtime +7 -delete 2>/dev/null
 exit 0
